@@ -1,12 +1,12 @@
 {
 	"schemaVersion": 1,
 	"version": "0.842.0-rc1",
-	"sourceCommit": "a85ce5bed84c2bfb794a26ab4fdbeaf36a9d859e",
+	"sourceCommit": "3157fa0af4c7375a70bba6fd4cca953ae0f5df70",
 	"files": [
 		{
 			"path": ".github/workflows/publish.yml",
-			"size": 52934,
-			"sha256": "1b4608ce7f9f035925716dee26f61e9157f19a5994581ec5b82c0444f018cac2"
+			"size": 54773,
+			"sha256": "72f4c8103929afad2a4ba096f261c91c3d1ba79a31764576c83baf6914d4672e"
 		},
 		{
 			"path": "CHANGELOG.md",
@@ -62,6 +62,16 @@
 			"path": "THIRD_PARTY_NOTICES.md",
 			"size": 879,
 			"sha256": "93c4d01c245bea598acd97d2ebf9edfa63375af543610593ba6987eba0e02a55"
+		},
+		{
+			"path": "channels/default",
+			"size": 12,
+			"sha256": "c973b396aa125ac3ae37c2d3e36f3a36028bd45ce82850d9215b2fd8ef507cce"
+		},
+		{
+			"path": "channels/rc",
+			"size": 12,
+			"sha256": "c973b396aa125ac3ae37c2d3e36f3a36028bd45ce82850d9215b2fd8ef507cce"
 		},
 		{
 			"path": "install.ps1",

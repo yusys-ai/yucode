@@ -16,6 +16,10 @@ on:
         description: 'Exact public metadata commit'
         required: true
         type: string
+      release_id:
+        description: 'Exact public release ID'
+        required: true
+        type: string
       build_run_id:
         description: 'Exact private build workflow run ID'
         required: true
@@ -35,7 +39,7 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     outputs:
       checksums_sha256: ${{ steps.release.outputs.checksums_sha256 }}
       kind: ${{ steps.release.outputs.kind }}
@@ -47,11 +51,13 @@ jobs:
           BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
           RELEASE_KIND: ${{ inputs.kind }}
+          RELEASE_ID: ${{ inputs.release_id }}
           RELEASE_TAG: ${{ inputs.tag }}
           PUBLIC_COMMIT: ${{ inputs.public_commit }}
         run: |
           set -euo pipefail
           [[ "${PUBLIC_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${RELEASE_ID}" =~ ^[1-9][0-9]*$ ]]
           [[ "${BUILD_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
           [[ "${BUILD_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
           case "${RELEASE_KIND}" in
@@ -103,7 +109,7 @@ jobs:
                 type == "object" and
                 keys == ["path", "sha256", "size"] and
                 (.path | type) == "string" and
-                (.path | test("^[A-Za-z0-9._/-]+$")) and
+                (.path | test("^[A-Za-z0-9.@_/-]+$")) and
                 (.path | startswith("/") | not) and
                 ((.path | split("/")) | all(.[]; . != "" and . != "." and . != "..")) and
                 (.size | type) == "number" and
@@ -179,6 +185,7 @@ jobs:
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_KIND: ${{ inputs.kind }}
+          RELEASE_ID: ${{ inputs.release_id }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
@@ -186,7 +193,7 @@ jobs:
           version="${RELEASE_TAG#v}"
           verification="$(mktemp -d)"
           trap 'rm -rf "${verification}"' EXIT
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "${verification}/release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "${verification}/release.json"
           expected_prerelease=false
           if [[ "${RELEASE_KIND}" == rc ]]; then expected_prerelease=true; fi
           jq -e \
@@ -213,10 +220,17 @@ jobs:
             test "$(jq -r .immutable "${verification}/release.json")" = true
           fi
           release_id="$(jq -r '.id | tostring' "${verification}/release.json")"
-          [[ "${release_id}" =~ ^[1-9][0-9]*$ ]]
+          test "${release_id}" = "${RELEASE_ID}"
 
           mkdir release
-          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release
+          while IFS=$'\t' read -r asset_id filename; do
+            [[ "${asset_id}" =~ ^[1-9][0-9]*$ ]]
+            [[ "${filename}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "release/${filename}"
+          done < <(jq -r '.assets[] | [(.id | tostring), .name] | @tsv' "${verification}/release.json")
           test -f release/SHA256SUMS
           awk '
             $0 !~ /^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
@@ -396,7 +410,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - name: Checkout release metadata
@@ -420,13 +434,24 @@ jobs:
         env:
           CHECKSUMS_SHA256: ${{ needs.preflight.outputs.checksums_sha256 }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.preflight.outputs.release_id }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           verification="$(mktemp -d)"
           trap 'rm -rf "${verification}"' EXIT
           mkdir release
-          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "${verification}/release.json"
+          test "$(jq -r '.id | tostring' "${verification}/release.json")" = "${RELEASE_ID}"
+          test "$(jq -r .tag_name "${verification}/release.json")" = "${RELEASE_TAG}"
+          while IFS=$'\t' read -r asset_id filename; do
+            [[ "${asset_id}" =~ ^[1-9][0-9]*$ ]]
+            [[ "${filename}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "release/${filename}"
+          done < <(jq -r '.assets[] | [(.id | tostring), .name] | @tsv' "${verification}/release.json")
           test "$(sha256sum release/SHA256SUMS | awk '{print $1}')" = "${CHECKSUMS_SHA256}"
           awk '{print $2}' release/SHA256SUMS | sort > "${verification}/expected-assets"
           printf '%s\n' SHA256SUMS >> "${verification}/expected-assets"
@@ -717,7 +742,7 @@ jobs:
           test "$(jq -r .object.type <<<"${tag}")" = commit
           test "$(jq -r .object.sha <<<"${tag}")" = "${PUBLIC_COMMIT}"
 
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "${verification}/release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" > "${verification}/release.json"
           test "$(jq -r '.id | tostring' "${verification}/release.json")" = "${EXPECTED_RELEASE_ID}"
           test "$(jq -r .tag_name "${verification}/release.json")" = "${RELEASE_TAG}"
           expected_prerelease=false
@@ -728,7 +753,14 @@ jobs:
           fi
 
           mkdir release
-          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release
+          while IFS=$'\t' read -r asset_id filename; do
+            [[ "${asset_id}" =~ ^[1-9][0-9]*$ ]]
+            [[ "${filename}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "release/${filename}"
+          done < <(jq -r '.assets[] | [(.id | tostring), .name] | @tsv' "${verification}/release.json")
           test "$(sha256sum release/SHA256SUMS | awk '{print $1}')" = "${CHECKSUMS_SHA256}"
           awk '{print $2}' release/SHA256SUMS | sort > "${verification}/expected-assets"
           printf '%s\n' SHA256SUMS >> "${verification}/expected-assets"
@@ -750,12 +782,13 @@ jobs:
           done < "${verification}/expected-assets"
 
           if [[ "$(jq -r .draft "${verification}/release.json")" == true ]]; then
-            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+            jq -n '{draft:false}' \
+              | gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --method PATCH --input - >/dev/null
           fi
 
           immutable=false
           for _ in {1..12}; do
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "${verification}/published-release.json"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" > "${verification}/published-release.json"
             test "$(jq -r '.id | tostring' "${verification}/published-release.json")" = "${EXPECTED_RELEASE_ID}"
             test "$(jq -r .tag_name "${verification}/published-release.json")" = "${RELEASE_TAG}"
             if [[ "$(jq -r .draft "${verification}/published-release.json")" == false ]] \
@@ -767,7 +800,8 @@ jobs:
           done
           if [[ "${immutable}" != true ]]; then
             if [[ "$(jq -r '.immutable // false' "${verification}/published-release.json")" == false ]]; then
-              gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=true || true
+              jq -n '{draft:true}' \
+                | gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --method PATCH --input - >/dev/null || true
             fi
             echo "::error::Release did not become immutable"
             exit 1
