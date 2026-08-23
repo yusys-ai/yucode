@@ -1,0 +1,77 @@
+{
+	"schemaVersion": 1,
+	"version": "0.842.0-rc1",
+	"sourceCommit": "a85ce5bed84c2bfb794a26ab4fdbeaf36a9d859e",
+	"files": [
+		{
+			"path": ".github/workflows/publish.yml",
+			"size": 52934,
+			"sha256": "1b4608ce7f9f035925716dee26f61e9157f19a5994581ec5b82c0444f018cac2"
+		},
+		{
+			"path": "CHANGELOG.md",
+			"size": 114,
+			"sha256": "91a2816fdf1198495e0cdec2399e3200ccccaed318fb542ce7280f1671f6964e"
+		},
+		{
+			"path": "LICENSE",
+			"size": 1085,
+			"sha256": "8e0748f7bf63981255b42265afd8a2555f99e26c5e5f4a0e550e19f9449ced5f"
+		},
+		{
+			"path": "LICENSES/npm/cross-spawn@7.0.6/LICENSE",
+			"size": 1105,
+			"sha256": "aaa78451b6fecd1b9c4594c796c133c0e90cad100372ff8bc6de615e9ef9adf1"
+		},
+		{
+			"path": "LICENSES/npm/isexe@2.0.0/LICENSE",
+			"size": 765,
+			"sha256": "4ec3d4c66cd87f5c8d8ad911b10f99bf27cb00cdfcff82621956e379186b016b"
+		},
+		{
+			"path": "LICENSES/npm/path-key@3.1.1/license",
+			"size": 1109,
+			"sha256": "48da2f39e100d4085767e94966b43f4fa95ff6a0698fba57ed460914e35f94a0"
+		},
+		{
+			"path": "LICENSES/npm/shebang-command@2.0.0/license",
+			"size": 1116,
+			"sha256": "69dee148a2cc470554dfa7142e830662062394d0fe67cddd379aba90dc60d6b3"
+		},
+		{
+			"path": "LICENSES/npm/shebang-regex@3.0.0/license",
+			"size": 1109,
+			"sha256": "48da2f39e100d4085767e94966b43f4fa95ff6a0698fba57ed460914e35f94a0"
+		},
+		{
+			"path": "LICENSES/npm/which@2.0.2/LICENSE",
+			"size": 765,
+			"sha256": "4ec3d4c66cd87f5c8d8ad911b10f99bf27cb00cdfcff82621956e379186b016b"
+		},
+		{
+			"path": "LICENSES/pi-MIT.txt",
+			"size": 1070,
+			"sha256": "4f6a1985796db5225e3b1e59972bd47e07a27a0748427cb3d3c8fbf39f9311f0"
+		},
+		{
+			"path": "README.md",
+			"size": 3336,
+			"sha256": "fcc90f899166d1f6e72151dcd5a02c7a8c5a466d8b5381840bfc0e63c7116da1"
+		},
+		{
+			"path": "THIRD_PARTY_NOTICES.md",
+			"size": 879,
+			"sha256": "93c4d01c245bea598acd97d2ebf9edfa63375af543610593ba6987eba0e02a55"
+		},
+		{
+			"path": "install.ps1",
+			"size": 35981,
+			"sha256": "818c946f8ef4624be9e05f22e37efd0a97f24a9d36218a8fe091fa08757104fc"
+		},
+		{
+			"path": "install.sh",
+			"size": 30637,
+			"sha256": "d12c882853c7501d7c096fbd523d29ac0a210754e343edcfebe04e15599e2fa7"
+		}
+	]
+}

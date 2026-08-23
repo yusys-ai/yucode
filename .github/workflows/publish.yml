@@ -1,0 +1,1022 @@
+name: Publish Yusys CodeMate
+run-name: Publish ${{ inputs.tag }} @ ${{ inputs.public_commit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Release kind: rc or stable'
+        required: true
+        type: string
+      tag:
+        description: 'Exact public release tag'
+        required: true
+        type: string
+      public_commit:
+        description: 'Exact public metadata commit'
+        required: true
+        type: string
+      build_run_id:
+        description: 'Exact private build workflow run ID'
+        required: true
+        type: string
+      build_run_attempt:
+        description: 'Exact private build workflow run attempt'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: yucode-public-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      checksums_sha256: ${{ steps.release.outputs.checksums_sha256 }}
+      kind: ${{ steps.release.outputs.kind }}
+      release_id: ${{ steps.release.outputs.release_id }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Validate release inputs
+        env:
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          RELEASE_KIND: ${{ inputs.kind }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+        run: |
+          set -euo pipefail
+          [[ "${PUBLIC_COMMIT}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${BUILD_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${BUILD_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]
+          case "${RELEASE_KIND}" in
+            rc) [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc[1-9][0-9]*$ ]] ;;
+            stable) [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ;;
+            *) exit 1 ;;
+          esac
+          test "${GITHUB_REF}" = "refs/tags/${RELEASE_TAG}"
+          test "${GITHUB_SHA}" = "${PUBLIC_COMMIT}"
+
+      - name: Checkout release metadata
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify public projection
+        env:
+          RELEASE_KIND: ${{ inputs.kind }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          version="${RELEASE_TAG#v}"
+          test "$(git rev-parse HEAD)" = "${PUBLIC_COMMIT}"
+          test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "${PUBLIC_COMMIT}"
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          current_main="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "${current_main}" != "${PUBLIC_COMMIT}" ]]; then
+            read -r -a commit_and_parents <<<"$(git rev-list --parents -n 1 HEAD)"
+            test "${#commit_and_parents[@]}" -eq 2
+            test "${commit_and_parents[1]}" = "${current_main}"
+          fi
+
+          test -f PUBLIC_REPOSITORY_MANIFEST.json
+          jq -e \
+            --arg version "${version}" '
+              type == "object" and
+              keys == ["files", "schemaVersion", "sourceCommit", "version"] and
+              .schemaVersion == 1 and
+              .version == $version and
+              (.sourceCommit | type) == "string" and
+              (.sourceCommit | test("^[0-9a-f]{40}$")) and
+              (.files | type) == "array" and
+              (.files | length) > 0 and
+              all(.files[];
+                type == "object" and
+                keys == ["path", "sha256", "size"] and
+                (.path | type) == "string" and
+                (.path | test("^[A-Za-z0-9._/-]+$")) and
+                (.path | startswith("/") | not) and
+                ((.path | split("/")) | all(.[]; . != "" and . != "." and . != "..")) and
+                (.size | type) == "number" and
+                .size >= 0 and .size <= 9007199254740991 and .size == (.size | floor) and
+                (.sha256 | type) == "string" and
+                (.sha256 | test("^[0-9a-f]{64}$"))
+              ) and
+              ([.files[].path] == ([.files[].path] | sort)) and
+              ([.files[].path] | unique | length) == (.files | length)
+            ' PUBLIC_REPOSITORY_MANIFEST.json >/dev/null
+
+          verification="$(mktemp -d)"
+          trap 'rm -rf "${verification}"' EXIT
+          jq -r '.files[].path' PUBLIC_REPOSITORY_MANIFEST.json > "${verification}/expected-files"
+          printf '%s\n' PUBLIC_REPOSITORY_MANIFEST.json >> "${verification}/expected-files"
+          sort -o "${verification}/expected-files" "${verification}/expected-files"
+          git ls-files | sort > "${verification}/actual-files"
+          diff -u "${verification}/expected-files" "${verification}/actual-files"
+          test -z "$(git ls-files --stage | awk '$1 != "100644" && $1 != "100755" { print; exit }')"
+
+          while IFS=$'\t' read -r path size digest; do
+            case "${path%%/*}" in
+              .github|bin|channels|CHANGELOG.md|LICENSE|LICENSES|package.json|README.md|THIRD_PARTY_NOTICES.md|install.ps1|install.sh) ;;
+              *) exit 1 ;;
+            esac
+            test -f "${path}"
+            test "$(stat -c %s "${path}")" = "${size}"
+            test "$(sha256sum "${path}" | awk '{print $1}')" = "${digest}"
+          done < <(jq -r '.files[] | [.path, (.size | tostring), .sha256] | @tsv' PUBLIC_REPOSITORY_MANIFEST.json)
+
+          for required in \
+            .github/workflows/publish.yml \
+            CHANGELOG.md LICENSE LICENSES/pi-MIT.txt README.md THIRD_PARTY_NOTICES.md \
+            install.ps1 install.sh; do
+            grep -Fxq "${required}" "${verification}/expected-files"
+          done
+          test "$(git ls-files .github)" = .github/workflows/publish.yml
+          if [[ "${RELEASE_KIND}" == stable ]]; then
+            grep -Fxq package.json "${verification}/expected-files"
+            grep -Fxq bin/yucode-launcher.mjs "${verification}/expected-files"
+          fi
+
+          validate_channel() {
+            local channel_file="$1"
+            local channel_value
+            test "$(wc -l < "${channel_file}")" -eq 1
+            test "$(tail -c 1 "${channel_file}" | od -An -t x1 | tr -d ' \n')" = 0a
+            channel_value="$(sed -n '1p' "${channel_file}")"
+            [[ "${channel_value}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc[1-9][0-9]*)?$ ]]
+            test "$(stat -c %s "${channel_file}")" -eq "$((${#channel_value} + 1))"
+          }
+          while IFS= read -r channel_file; do
+            case "${channel_file}" in
+              channels/default|channels/rc|channels/stable) ;;
+              *) exit 1 ;;
+            esac
+            validate_channel "${channel_file}"
+          done < <(git ls-files channels)
+          test "$(cat "channels/${RELEASE_KIND}")" = "${version}"
+          if [[ "${RELEASE_KIND}" == stable ]]; then
+            test "$(cat channels/default)" = "${version}"
+            test "$(cat channels/rc)" = "${version}"
+          elif [[ -f channels/stable ]]; then
+            test "$(cat channels/default)" = "$(cat channels/stable)"
+          else
+            test "$(cat channels/default)" = "${version}"
+          fi
+
+      - name: Download and verify release payload
+        id: release
+        env:
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_KIND: ${{ inputs.kind }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          version="${RELEASE_TAG#v}"
+          verification="$(mktemp -d)"
+          trap 'rm -rf "${verification}"' EXIT
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "${verification}/release.json"
+          expected_prerelease=false
+          if [[ "${RELEASE_KIND}" == rc ]]; then expected_prerelease=true; fi
+          jq -e \
+            --arg tag "${RELEASE_TAG}" \
+            --argjson prerelease "${expected_prerelease}" '
+              type == "object" and
+              .tag_name == $tag and
+              .name == $tag and
+              (.draft | type) == "boolean" and
+              .prerelease == $prerelease and
+              (.assets | type) == "array" and
+              (.assets | length) > 0 and
+              ([.assets[].name] | unique | length) == (.assets | length) and
+              all(.assets[];
+                (.name | type) == "string" and
+                (.name | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+                .state == "uploaded" and
+                (.size | type) == "number" and .size > 0 and .size <= 9007199254740991 and .size == (.size | floor) and
+                (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))
+              )
+            ' "${verification}/release.json" >/dev/null
+          release_state="$(jq -r 'if .draft then "draft" else "published" end' "${verification}/release.json")"
+          if [[ "${release_state}" == published ]]; then
+            test "$(jq -r .immutable "${verification}/release.json")" = true
+          fi
+          release_id="$(jq -r '.id | tostring' "${verification}/release.json")"
+          [[ "${release_id}" =~ ^[1-9][0-9]*$ ]]
+
+          mkdir release
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release
+          test -f release/SHA256SUMS
+          awk '
+            $0 !~ /^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
+            seen[$2]++ { exit 1 }
+            { count++ }
+            END { if (count == 0) exit 1 }
+          ' release/SHA256SUMS
+          awk '{print $2}' release/SHA256SUMS | sort > "${verification}/listed-assets"
+          find release -maxdepth 1 -type f ! -name SHA256SUMS -exec basename {} \; | sort > "${verification}/downloaded-assets"
+          diff -u "${verification}/listed-assets" "${verification}/downloaded-assets"
+          (
+            cd release
+            sha256sum --check --strict SHA256SUMS
+          )
+          jq -r '.assets[].name' "${verification}/release.json" | sort > "${verification}/api-assets"
+          cp "${verification}/listed-assets" "${verification}/expected-assets"
+          printf '%s\n' SHA256SUMS >> "${verification}/expected-assets"
+          sort -o "${verification}/expected-assets" "${verification}/expected-assets"
+          diff -u "${verification}/expected-assets" "${verification}/api-assets"
+          while IFS= read -r filename; do
+            digest="$(sha256sum "release/${filename}" | awk '{print $1}')"
+            size="$(stat -c %s "release/${filename}")"
+            asset="$(jq -ce --arg filename "${filename}" '.assets[] | select(.name == $filename)' "${verification}/release.json")"
+            test "$(jq -r .digest <<<"${asset}")" = "sha256:${digest}"
+            test "$(jq -r .size <<<"${asset}")" = "${size}"
+          done < "${verification}/expected-assets"
+
+          printf '%s\n' \
+            yucode-darwin-arm64.tar.gz \
+            yucode-darwin-x64.tar.gz \
+            yucode-linux-arm64.tar.gz \
+            yucode-linux-x64.tar.gz \
+            yucode-windows-arm64.zip \
+            yucode-windows-x64.zip | sort > "${verification}/binary-assets"
+
+          source_commit="$(jq -r .sourceCommit PUBLIC_REPOSITORY_MANIFEST.json)"
+          if [[ "${RELEASE_KIND}" == rc ]]; then
+            cp "${verification}/binary-assets" "${verification}/expected-payload"
+            printf '%s\n' RC_MANIFEST.json >> "${verification}/expected-payload"
+            sort -o "${verification}/expected-payload" "${verification}/expected-payload"
+            diff -u "${verification}/expected-payload" "${verification}/listed-assets"
+            source_version="${version%-rc*}"
+            jq -e \
+              --arg version "${version}" \
+              --arg tag "${RELEASE_TAG}" \
+              --arg source_version "${source_version}" \
+              --arg source_commit "${source_commit}" \
+              --arg build_run_id "${BUILD_RUN_ID}" \
+              --arg build_run_attempt "${BUILD_RUN_ATTEMPT}" '
+                type == "object" and
+                keys == ["assets", "build", "channel", "kind", "schemaVersion", "sourceCommit", "sourceVersion", "tag", "version"] and
+                .schemaVersion == 1 and .kind == "rc" and
+                .version == $version and .tag == $tag and
+                .sourceVersion == $source_version and .sourceCommit == $source_commit and
+                .build == {runId:$build_run_id, runAttempt:$build_run_attempt} and
+                .channel == {name:"rc", setDefaultUntilStable:true} and
+                (.assets | type) == "array" and (.assets | length) == 6 and
+                all(.assets[];
+                  type == "object" and keys == ["filename", "platform", "sha256", "size"] and
+                  (.filename | type) == "string" and (.filename | test("^[a-z0-9][a-z0-9._-]*$")) and
+                  (.platform | type) == "string" and
+                  (.size | type) == "number" and .size > 0 and .size <= 9007199254740991 and .size == (.size | floor) and
+                  (.sha256 | type) == "string" and (.sha256 | test("^[0-9a-f]{64}$"))
+                ) and
+                ([.assets[].filename] | unique | length) == 6 and
+                ([.assets[].platform] | unique | length) == 6
+              ' release/RC_MANIFEST.json >/dev/null
+            jq -r '.assets[].filename' release/RC_MANIFEST.json | sort > "${verification}/manifest-assets"
+            diff -u "${verification}/binary-assets" "${verification}/manifest-assets"
+            while IFS=$'\t' read -r filename platform size digest; do
+              case "${platform}" in
+                darwin-arm64) expected_filename=yucode-darwin-arm64.tar.gz ;;
+                darwin-x64) expected_filename=yucode-darwin-x64.tar.gz ;;
+                linux-arm64) expected_filename=yucode-linux-arm64.tar.gz ;;
+                linux-x64) expected_filename=yucode-linux-x64.tar.gz ;;
+                windows-arm64) expected_filename=yucode-windows-arm64.zip ;;
+                windows-x64) expected_filename=yucode-windows-x64.zip ;;
+                *) exit 1 ;;
+              esac
+              test "${filename}" = "${expected_filename}"
+              test "$(stat -c %s "release/${filename}")" = "${size}"
+              test "$(sha256sum "release/${filename}" | awk '{print $1}')" = "${digest}"
+            done < <(jq -r '.assets[] | [.filename, .platform, (.size | tostring), .sha256] | @tsv' release/RC_MANIFEST.json)
+          else
+            jq -e \
+              --arg version "${version}" \
+              --arg tag "${RELEASE_TAG}" \
+              --arg source_commit "${source_commit}" \
+              --arg build_run_id "${BUILD_RUN_ID}" \
+              --arg build_run_attempt "${BUILD_RUN_ATTEMPT}" '
+                type == "object" and
+                keys == ["build", "kind", "packages", "schemaVersion", "sourceCommit", "tag", "version"] and
+                .schemaVersion == 1 and .kind == "stable" and
+                .version == $version and .tag == $tag and .sourceCommit == $source_commit and
+                .build == {runId:$build_run_id, runAttempt:$build_run_attempt} and
+                (.packages | type) == "array" and (.packages | length) == 7 and
+                all(.packages[];
+                  type == "object" and
+                  (.name | type) == "string" and (.version | type) == "string" and .version == $version and
+                  (.file | type) == "string" and (.file | test("^[a-z0-9][a-z0-9._-]*[.]tgz$")) and
+                  (.size | type) == "number" and .size > 0 and .size <= 9007199254740991 and .size == (.size | floor) and
+                  (.integrity | type) == "string" and (.integrity | test("^sha512-[A-Za-z0-9+/]+={0,2}$")) and
+                  (.shasum | type) == "string" and (.shasum | test("^[0-9a-f]{40}$"))
+                ) and
+                ([.packages[].name] | unique | length) == 7 and
+                ([.packages[].file] | unique | length) == 7
+              ' release/release-manifest.json >/dev/null
+
+            printf '%s\n' \
+              @yusys-ai/roche-darwin-arm64 \
+              @yusys-ai/roche-darwin-x64 \
+              @yusys-ai/roche-linux-arm64 \
+              @yusys-ai/roche-linux-x64 \
+              @yusys-ai/roche-windows-arm64 \
+              @yusys-ai/roche-windows-x64 \
+              @yusys-ai/yucode | sort > "${verification}/expected-packages"
+            jq -r '.packages[].name' release/release-manifest.json | sort > "${verification}/actual-packages"
+            diff -u "${verification}/expected-packages" "${verification}/actual-packages"
+
+            while IFS= read -r package_name; do
+              entry="$(jq -ce --arg name "${package_name}" '.packages[] | select(.name == $name)' release/release-manifest.json)"
+              case "${package_name}" in
+                @yusys-ai/roche-darwin-arm64)
+                  expected_keys='["cpu","file","integrity","name","os","shasum","size","version"]'
+                  expected_os=darwin; expected_cpu=arm64; expected_libc= ;;
+                @yusys-ai/roche-darwin-x64)
+                  expected_keys='["cpu","file","integrity","name","os","shasum","size","version"]'
+                  expected_os=darwin; expected_cpu=x64; expected_libc= ;;
+                @yusys-ai/roche-linux-arm64)
+                  expected_keys='["cpu","file","integrity","libc","name","os","shasum","size","version"]'
+                  expected_os=linux; expected_cpu=arm64; expected_libc=glibc ;;
+                @yusys-ai/roche-linux-x64)
+                  expected_keys='["cpu","file","integrity","libc","name","os","shasum","size","version"]'
+                  expected_os=linux; expected_cpu=x64; expected_libc=glibc ;;
+                @yusys-ai/roche-windows-arm64)
+                  expected_keys='["cpu","file","integrity","name","os","shasum","size","version"]'
+                  expected_os=win32; expected_cpu=arm64; expected_libc= ;;
+                @yusys-ai/roche-windows-x64)
+                  expected_keys='["cpu","file","integrity","name","os","shasum","size","version"]'
+                  expected_os=win32; expected_cpu=x64; expected_libc= ;;
+                @yusys-ai/yucode)
+                  expected_keys='["file","integrity","name","shasum","size","version"]'
+                  expected_os=; expected_cpu=; expected_libc= ;;
+                *) exit 1 ;;
+              esac
+              test "$(jq -c 'keys' <<<"${entry}")" = "${expected_keys}"
+              test "$(jq -r '.os // ""' <<<"${entry}")" = "${expected_os}"
+              test "$(jq -r '.cpu // ""' <<<"${entry}")" = "${expected_cpu}"
+              test "$(jq -r '.libc // ""' <<<"${entry}")" = "${expected_libc}"
+              package_file="$(jq -r .file <<<"${entry}")"
+              package_size="$(jq -r .size <<<"${entry}")"
+              package_integrity="$(jq -r .integrity <<<"${entry}")"
+              package_shasum="$(jq -r .shasum <<<"${entry}")"
+              test "$(stat -c %s "release/${package_file}")" = "${package_size}"
+              test "$(sha1sum "release/${package_file}" | awk '{print $1}')" = "${package_shasum}"
+              actual_integrity="sha512-$(openssl dgst -sha512 -binary "release/${package_file}" | openssl base64 -A)"
+              test "${actual_integrity}" = "${package_integrity}"
+            done < "${verification}/expected-packages"
+
+            cp "${verification}/binary-assets" "${verification}/expected-payload"
+            jq -r '.packages[].file' release/release-manifest.json >> "${verification}/expected-payload"
+            printf '%s\n' release-manifest.json >> "${verification}/expected-payload"
+            sort -o "${verification}/expected-payload" "${verification}/expected-payload"
+            diff -u "${verification}/expected-payload" "${verification}/listed-assets"
+          fi
+
+          {
+            echo "checksums_sha256=$(sha256sum release/SHA256SUMS | awk '{print $1}')"
+            echo "kind=${RELEASE_KIND}"
+            echo "release_id=${release_id}"
+            echo "version=${version}"
+          } >> "${GITHUB_OUTPUT}"
+
+  publish-npm:
+    if: needs.preflight.outputs.kind == 'stable'
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout release metadata
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Verify release commit
+        env:
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+        run: test "$(git rev-parse HEAD)" = "${PUBLIC_COMMIT}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download exact release packages
+        env:
+          CHECKSUMS_SHA256: ${{ needs.preflight.outputs.checksums_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          verification="$(mktemp -d)"
+          trap 'rm -rf "${verification}"' EXIT
+          mkdir release
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release
+          test "$(sha256sum release/SHA256SUMS | awk '{print $1}')" = "${CHECKSUMS_SHA256}"
+          awk '{print $2}' release/SHA256SUMS | sort > "${verification}/expected-assets"
+          printf '%s\n' SHA256SUMS >> "${verification}/expected-assets"
+          sort -o "${verification}/expected-assets" "${verification}/expected-assets"
+          find release -maxdepth 1 -type f -exec basename {} \; | sort > "${verification}/actual-assets"
+          diff -u "${verification}/expected-assets" "${verification}/actual-assets"
+          (
+            cd release
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@11.16.0 --ignore-scripts
+          test "$(npm --version)" = 11.16.0
+
+      - name: Validate release packages
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          version="${RELEASE_TAG#v}"
+          test "$(jq -r .version release/release-manifest.json)" = "${version}"
+          printf '%s\n' \
+            @yusys-ai/roche-darwin-arm64 \
+            @yusys-ai/roche-darwin-x64 \
+            @yusys-ai/roche-linux-arm64 \
+            @yusys-ai/roche-linux-x64 \
+            @yusys-ai/roche-windows-arm64 \
+            @yusys-ai/roche-windows-x64 | sort > release/platform-packages
+          printf '%s\n' @yusys-ai/yucode > release/launcher-package
+          cat release/platform-packages release/launcher-package | sort > release/expected-packages
+          jq -r '.packages[].name' release/release-manifest.json | sort > release/actual-packages
+          diff -u release/expected-packages release/actual-packages
+          test "$(find release -maxdepth 1 -type f -name '*.tgz' | wc -l)" -eq 7
+          jq -r '.packages[].file' release/release-manifest.json | sort > release/manifest-package-files
+          find release -maxdepth 1 -type f -name '*.tgz' -exec basename {} \; | sort > release/archive-package-files
+          diff -u release/manifest-package-files release/archive-package-files
+          mkdir "${RUNNER_TEMP}/npm-pack-validation"
+          : > release/validated-packages.tsv
+
+          while IFS= read -r package_name; do
+            entry="$(jq -ce --arg name "${package_name}" '.packages[] | select(.name == $name)' release/release-manifest.json)"
+            package_version="$(jq -r .version <<<"${entry}")"
+            package_file="$(jq -r .file <<<"${entry}")"
+            package_size="$(jq -r .size <<<"${entry}")"
+            package_integrity="$(jq -r .integrity <<<"${entry}")"
+            package_shasum="$(jq -r .shasum <<<"${entry}")"
+            test "${package_version}" = "${version}"
+            package_path="./release/${package_file}"
+            test -f "${package_path}"
+            test "$(stat -c %s "${package_path}")" = "${package_size}"
+            test "$(sha1sum "${package_path}" | awk '{print $1}')" = "${package_shasum}"
+            test "sha512-$(openssl dgst -sha512 -binary "${package_path}" | openssl base64 -A)" = "${package_integrity}"
+
+            case "${package_name}" in
+              @yusys-ai/roche-darwin-arm64)
+                expected_os=darwin; expected_cpu=arm64; expected_libc=; expected_binary=bin/yucode ;;
+              @yusys-ai/roche-darwin-x64)
+                expected_os=darwin; expected_cpu=x64; expected_libc=; expected_binary=bin/yucode ;;
+              @yusys-ai/roche-linux-arm64)
+                expected_os=linux; expected_cpu=arm64; expected_libc=glibc; expected_binary=bin/yucode ;;
+              @yusys-ai/roche-linux-x64)
+                expected_os=linux; expected_cpu=x64; expected_libc=glibc; expected_binary=bin/yucode ;;
+              @yusys-ai/roche-windows-arm64)
+                expected_os=win32; expected_cpu=arm64; expected_libc=; expected_binary=bin/yucode.exe ;;
+              @yusys-ai/roche-windows-x64)
+                expected_os=win32; expected_cpu=x64; expected_libc=; expected_binary=bin/yucode.exe ;;
+              @yusys-ai/yucode)
+                expected_os=; expected_cpu=; expected_libc=; expected_binary=bin/yucode-launcher.mjs ;;
+              *) exit 1 ;;
+            esac
+
+            package_json="$(tar -xOzf "${package_path}" package/package.json)"
+            test "$(jq -r .name <<<"${package_json}")" = "${package_name}"
+            test "$(jq -r .version <<<"${package_json}")" = "${version}"
+            expected_os_json="$(jq -cn --arg value "${expected_os}" '$value | if . == "" then [] else [.] end')"
+            expected_cpu_json="$(jq -cn --arg value "${expected_cpu}" '$value | if . == "" then [] else [.] end')"
+            expected_libc_json="$(jq -cn --arg value "${expected_libc}" '$value | if . == "" then [] else [.] end')"
+            test "$(jq -c '.os // []' <<<"${package_json}")" = "${expected_os_json}"
+            test "$(jq -c '.cpu // []' <<<"${package_json}")" = "${expected_cpu_json}"
+            test "$(jq -c '.libc // []' <<<"${package_json}")" = "${expected_libc_json}"
+            jq -e '
+              (has("private") | not) and
+              ((.scripts // {}) | length) == 0 and
+              ((.dependencies // {}) | length) == 0 and
+              ((.devDependencies // {}) | length) == 0 and
+              ((.bundleDependencies // []) | length) == 0 and
+              ((.bundledDependencies // []) | length) == 0 and
+              .publishConfig == {access:"public"} and
+              .repository == {type:"git", url:"git+https://github.com/yusys-ai/yucode.git"}
+            ' <<<"${package_json}" >/dev/null
+
+            pack_output="$(npm pack "${package_path}" --dry-run --offline --json --ignore-scripts --pack-destination "${RUNNER_TEMP}/npm-pack-validation")"
+            pack_record="$(jq -ce --arg name "${package_name}" '
+              if type == "object" and .name == $name then .
+              elif type == "object" and ((.[$name]? | type) == "object") and .[$name].name == $name then .[$name]
+              elif type == "array" then ([.[] | select(type == "object" and .name == $name)] | select(length == 1) | .[0])
+              else empty
+              end
+            ' <<<"${pack_output}")"
+            test "$(jq -r .version <<<"${pack_record}")" = "${version}"
+            test "$(jq -r .size <<<"${pack_record}")" = "${package_size}"
+            test "$(jq -r .integrity <<<"${pack_record}")" = "${package_integrity}"
+            test "$(jq -r .shasum <<<"${pack_record}")" = "${package_shasum}"
+            jq -e --arg path "${expected_binary}" 'any(.files[]; .path == $path)' <<<"${pack_record}" >/dev/null
+
+            if [[ "${package_name}" == @yusys-ai/yucode ]]; then
+              printf '%s\n' \
+                CHANGELOG.md LICENSE \
+                LICENSES/npm/cross-spawn@7.0.6/LICENSE \
+                LICENSES/npm/isexe@2.0.0/LICENSE \
+                LICENSES/npm/path-key@3.1.1/license \
+                LICENSES/npm/shebang-command@2.0.0/license \
+                LICENSES/npm/shebang-regex@3.0.0/license \
+                LICENSES/npm/which@2.0.2/LICENSE \
+                LICENSES/pi-MIT.txt README.md THIRD_PARTY_NOTICES.md \
+                bin/yucode-launcher.mjs package.json | sort > release/expected-launcher-files
+              jq -r '.files[].path' <<<"${pack_record}" | sort > release/actual-launcher-files
+              diff -u release/expected-launcher-files release/actual-launcher-files
+              test "$(jq -r '.bin.yucode' <<<"${package_json}")" = bin/yucode-launcher.mjs
+              test "$(jq -c '.optionalDependencies | keys' <<<"${package_json}")" = "$(jq -Rsc 'split("\n") | map(select(length > 0)) | sort' release/platform-packages)"
+              while IFS= read -r platform_package; do
+                test "$(jq -r --arg name "${platform_package}" '.optionalDependencies[$name]' <<<"${package_json}")" = "${version}"
+              done < release/platform-packages
+            else
+              test "$(jq -c '.optionalDependencies // {}' <<<"${package_json}")" = '{}'
+              for required in package.json LICENSE THIRD_PARTY_NOTICES.md "${expected_binary}" bin/package.json; do
+                jq -e --arg path "${required}" 'any(.files[]; .path == $path)' <<<"${pack_record}" >/dev/null
+              done
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "${package_name}" "${package_version}" "${package_file}" "${package_integrity}" "${package_shasum}" \
+              >> release/validated-packages.tsv
+          done < release/expected-packages
+
+          launcher_file="$(jq -r '.packages[] | select(.name == "@yusys-ai/yucode") | .file' release/release-manifest.json)"
+          tar -xOzf "release/${launcher_file}" package/package.json > release/launcher-package.json
+          tar -xOzf "release/${launcher_file}" package/bin/yucode-launcher.mjs > release/yucode-launcher.mjs
+          cmp package.json release/launcher-package.json
+          cmp bin/yucode-launcher.mjs release/yucode-launcher.mjs
+
+          : > release/publication-order.tsv
+          while IFS= read -r package_name; do
+            awk -F '\t' -v name="${package_name}" '$1 == name' release/validated-packages.tsv >> release/publication-order.tsv
+          done < release/platform-packages
+          awk -F '\t' '$1 == "@yusys-ai/yucode"' release/validated-packages.tsv >> release/publication-order.tsv
+          test "$(wc -l < release/publication-order.tsv)" -eq 7
+
+      - name: Publish exact release package set
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          read_registry_dist() {
+            local package_spec="$1"
+            local normalized
+            if npm view "${package_spec}" dist --json > "${RUNNER_TEMP}/npm-view.json" 2> "${RUNNER_TEMP}/npm-view.err"; then
+              if ! normalized="$(jq -ce '
+                (if type == "object" then . elif type == "array" and length == 1 then .[0] else empty end) |
+                select(type == "object" and (.integrity | type) == "string" and (.shasum | type) == "string")
+              ' "${RUNNER_TEMP}/npm-view.json")"; then
+                cat "${RUNNER_TEMP}/npm-view.json" >&2
+                return 1
+              fi
+              printf '%s\n' "${normalized}"
+              return 0
+            fi
+            if grep -Eq '"code"[[:space:]]*:[[:space:]]*"E404"|npm (error|ERR!) code E404' \
+              "${RUNNER_TEMP}/npm-view.json" "${RUNNER_TEMP}/npm-view.err"; then
+              return 44
+            fi
+            cat "${RUNNER_TEMP}/npm-view.json" "${RUNNER_TEMP}/npm-view.err" >&2
+            return 1
+          }
+
+          read_dist_tags() {
+            local package_name="$1"
+            local normalized
+            if ! npm view "${package_name}" dist-tags --json > "${RUNNER_TEMP}/npm-tags.json" 2> "${RUNNER_TEMP}/npm-tags.err"; then
+              cat "${RUNNER_TEMP}/npm-tags.json" "${RUNNER_TEMP}/npm-tags.err" >&2
+              return 1
+            fi
+            if ! normalized="$(jq -ce '
+              if type == "object" then . elif type == "array" and length == 1 and (.[0] | type) == "object" then .[0] else empty end
+            ' "${RUNNER_TEMP}/npm-tags.json")"; then
+              cat "${RUNNER_TEMP}/npm-tags.json" >&2
+              return 1
+            fi
+            printf '%s\n' "${normalized}"
+          }
+
+          version_is_greater() {
+            local left="$1"
+            local right="$2"
+            local left_parts right_parts index
+            [[ "${left}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            [[ "${right}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            IFS=. read -r -a left_parts <<<"${left}"
+            IFS=. read -r -a right_parts <<<"${right}"
+            for index in 0 1 2; do
+              if ((${#left_parts[index]} > ${#right_parts[index]})); then return 0; fi
+              if ((${#left_parts[index]} < ${#right_parts[index]})); then return 1; fi
+              if [[ "${left_parts[index]}" > "${right_parts[index]}" ]]; then return 0; fi
+              if [[ "${left_parts[index]}" < "${right_parts[index]}" ]]; then return 1; fi
+            done
+            return 1
+          }
+
+          : > release/publication-plan.tsv
+          while IFS=$'\t' read -r package_name package_version package_file package_integrity package_shasum; do
+            if published_dist="$(read_registry_dist "${package_name}@${package_version}")"; then
+              test "$(jq -r .integrity <<<"${published_dist}")" = "${package_integrity}"
+              test "$(jq -r .shasum <<<"${published_dist}")" = "${package_shasum}"
+              dist_tags="$(read_dist_tags "${package_name}")"
+              test "$(jq -r '.latest // empty' <<<"${dist_tags}")" = "${package_version}"
+            else
+              status=$?
+              test "${status}" -eq 44
+              dist_tags="$(read_dist_tags "${package_name}")"
+              current_latest="$(jq -r '.latest // empty' <<<"${dist_tags}")"
+              if [[ -n "${current_latest}" ]]; then
+                version_is_greater "${package_version}" "${current_latest}"
+              fi
+              printf '%s\t%s\t%s\t%s\t%s\n' \
+                "${package_name}" "${package_version}" "${package_file}" "${package_integrity}" "${package_shasum}" \
+                >> release/publication-plan.tsv
+            fi
+          done < release/publication-order.tsv
+
+          while IFS=$'\t' read -r package_name package_version package_file package_integrity package_shasum; do
+            npm publish "./release/${package_file}" \
+              --access public \
+              --provenance \
+              --tag latest \
+              --ignore-scripts
+            published=false
+            for _ in {1..12}; do
+              if published_dist="$(read_registry_dist "${package_name}@${package_version}")"; then
+                test "$(jq -r .integrity <<<"${published_dist}")" = "${package_integrity}"
+                test "$(jq -r .shasum <<<"${published_dist}")" = "${package_shasum}"
+                dist_tags="$(read_dist_tags "${package_name}")"
+                if [[ "$(jq -r '.latest // empty' <<<"${dist_tags}")" == "${package_version}" ]]; then
+                  published=true
+                  break
+                fi
+              else
+                status=$?
+                test "${status}" -eq 44
+              fi
+              sleep 5
+            done
+            test "${published}" = true
+          done < release/publication-plan.tsv
+
+          while IFS=$'\t' read -r package_name package_version _package_file package_integrity package_shasum; do
+            published_dist="$(read_registry_dist "${package_name}@${package_version}")"
+            test "$(jq -r .integrity <<<"${published_dist}")" = "${package_integrity}"
+            test "$(jq -r .shasum <<<"${published_dist}")" = "${package_shasum}"
+            dist_tags="$(read_dist_tags "${package_name}")"
+            test "$(jq -r '.latest // empty' <<<"${dist_tags}")" = "${package_version}"
+          done < release/publication-order.tsv
+
+  publish-release:
+    if: >-
+      always() &&
+      needs.preflight.result == 'success' &&
+      (needs.preflight.outputs.kind == 'rc' || needs.publish-npm.result == 'success')
+    needs: [preflight, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Reverify and publish immutable GitHub Release
+        env:
+          CHECKSUMS_SHA256: ${{ needs.preflight.outputs.checksums_sha256 }}
+          EXPECTED_RELEASE_ID: ${{ needs.preflight.outputs.release_id }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+          RELEASE_KIND: ${{ needs.preflight.outputs.kind }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          verification="$(mktemp -d)"
+          trap 'rm -rf "${verification}"' EXIT
+          tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          test "$(jq -r .object.type <<<"${tag}")" = commit
+          test "$(jq -r .object.sha <<<"${tag}")" = "${PUBLIC_COMMIT}"
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "${verification}/release.json"
+          test "$(jq -r '.id | tostring' "${verification}/release.json")" = "${EXPECTED_RELEASE_ID}"
+          test "$(jq -r .tag_name "${verification}/release.json")" = "${RELEASE_TAG}"
+          expected_prerelease=false
+          if [[ "${RELEASE_KIND}" == rc ]]; then expected_prerelease=true; fi
+          test "$(jq -r .prerelease "${verification}/release.json")" = "${expected_prerelease}"
+          if [[ "$(jq -r .draft "${verification}/release.json")" == false ]]; then
+            test "$(jq -r .immutable "${verification}/release.json")" = true
+          fi
+
+          mkdir release
+          gh release download "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --dir release
+          test "$(sha256sum release/SHA256SUMS | awk '{print $1}')" = "${CHECKSUMS_SHA256}"
+          awk '{print $2}' release/SHA256SUMS | sort > "${verification}/expected-assets"
+          printf '%s\n' SHA256SUMS >> "${verification}/expected-assets"
+          sort -o "${verification}/expected-assets" "${verification}/expected-assets"
+          find release -maxdepth 1 -type f -exec basename {} \; | sort > "${verification}/actual-assets"
+          diff -u "${verification}/expected-assets" "${verification}/actual-assets"
+          (
+            cd release
+            sha256sum --check --strict SHA256SUMS
+          )
+          jq -r '.assets[].name' "${verification}/release.json" | sort > "${verification}/api-assets"
+          diff -u "${verification}/expected-assets" "${verification}/api-assets"
+          while IFS= read -r filename; do
+            digest="$(sha256sum "release/${filename}" | awk '{print $1}')"
+            size="$(stat -c %s "release/${filename}")"
+            asset="$(jq -ce --arg filename "${filename}" '.assets[] | select(.name == $filename)' "${verification}/release.json")"
+            test "$(jq -r .digest <<<"${asset}")" = "sha256:${digest}"
+            test "$(jq -r .size <<<"${asset}")" = "${size}"
+          done < "${verification}/expected-assets"
+
+          if [[ "$(jq -r .draft "${verification}/release.json")" == true ]]; then
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+          fi
+
+          immutable=false
+          for _ in {1..12}; do
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "${verification}/published-release.json"
+            test "$(jq -r '.id | tostring' "${verification}/published-release.json")" = "${EXPECTED_RELEASE_ID}"
+            test "$(jq -r .tag_name "${verification}/published-release.json")" = "${RELEASE_TAG}"
+            if [[ "$(jq -r .draft "${verification}/published-release.json")" == false ]] \
+              && [[ "$(jq -r .immutable "${verification}/published-release.json")" == true ]]; then
+              immutable=true
+              break
+            fi
+            sleep 5
+          done
+          if [[ "${immutable}" != true ]]; then
+            if [[ "$(jq -r '.immutable // false' "${verification}/published-release.json")" == false ]]; then
+              gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=true || true
+            fi
+            echo "::error::Release did not become immutable"
+            exit 1
+          fi
+          test "$(jq -r '.published_at | type' "${verification}/published-release.json")" = string
+
+  smoke-unix:
+    needs: [preflight, publish-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            kernel: Darwin
+            architecture: arm64
+          - runner: macos-15-intel
+            kernel: Darwin
+            architecture: x86_64
+          - runner: ubuntu-24.04
+            kernel: Linux
+            architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            kernel: Linux
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout installer source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Smoke public installer
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+          EXPECTED_KERNEL: ${{ matrix.kernel }}
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${PUBLIC_COMMIT}"
+          test "$(uname -s)" = "${EXPECTED_KERNEL}"
+          test "$(uname -m)" = "${EXPECTED_ARCHITECTURE}"
+          smoke_root="$(mktemp -d "${RUNNER_TEMP}/yucode-public-installer.XXXXXX")"
+          smoke_home="${smoke_root}/home"
+          downloaded_installer="${smoke_root}/install.sh"
+          mkdir -p "${smoke_home}"
+          trap 'rm -rf "${smoke_root}"' EXIT
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_TAG}/install.sh" \
+            --output "${downloaded_installer}"
+          cmp install.sh "${downloaded_installer}"
+
+          run_installer() {
+            if [[ "$1" == install ]]; then
+              HOME="${smoke_home}" \
+              PATH="${smoke_home}/.local/bin:${PATH}" \
+              SHELL=/bin/sh \
+              npm_config_prefix="${smoke_home}/.local" \
+              YUCODE_NO_MODIFY_PATH=1 \
+              YUCODE_VERSION="${RELEASE_VERSION}" \
+                sh "${downloaded_installer}"
+            else
+              HOME="${smoke_home}" \
+              PATH="${smoke_home}/.local/bin:${PATH}" \
+              SHELL=/bin/sh \
+              npm_config_prefix="${smoke_home}/.local" \
+              YUCODE_ACTION=uninstall \
+              YUCODE_NO_MODIFY_PATH=1 \
+              YUCODE_VERSION="${RELEASE_VERSION}" \
+                sh "${downloaded_installer}"
+            fi
+          }
+
+          wrapper="${smoke_home}/.local/bin/yucode"
+          install_root="${smoke_home}/.local/share/yucode"
+          run_installer install
+          test "$(HOME="${smoke_home}" "${wrapper}" --version)" = "${RELEASE_VERSION}"
+          HOME="${smoke_home}" "${wrapper}" --help >/dev/null
+          run_installer install
+
+          kept_data="${smoke_home}/.yucode/agent/keep"
+          mkdir -p "$(dirname "${kept_data}")"
+          printf '%s\n' keep > "${kept_data}"
+          run_installer uninstall
+          test ! -e "${wrapper}" && test ! -L "${wrapper}"
+          test ! -e "${install_root}"
+          test "$(cat "${kept_data}")" = keep
+
+          fake_package="${smoke_root}/npm-package"
+          mkdir -p "${fake_package}/bin"
+          printf '%s\n' \
+            '{' \
+            '  "name": "@yusys-ai/yucode",' \
+            '  "version": "0.0.0-smoke",' \
+            '  "bin": { "yucode": "bin/yucode.js" }' \
+            '}' > "${fake_package}/package.json"
+          printf '%s\n' '#!/usr/bin/env node' 'console.log("npm smoke")' > "${fake_package}/bin/yucode.js"
+          chmod 755 "${fake_package}/bin/yucode.js"
+          HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" \
+            npm pack "${fake_package}" --pack-destination "${smoke_root}" --ignore-scripts >/dev/null
+          fake_tgz="${smoke_root}/yusys-ai-yucode-0.0.0-smoke.tgz"
+          test -f "${fake_tgz}"
+          HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" \
+            npm install -g "${fake_tgz}" --ignore-scripts
+          npm_root="$(HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" npm root -g)"
+          test -f "${npm_root}/@yusys-ai/yucode/package.json"
+          test -e "${wrapper}" || test -L "${wrapper}"
+
+          run_installer install
+          test ! -e "${npm_root}/@yusys-ai/yucode" && test ! -L "${npm_root}/@yusys-ai/yucode"
+          test -f "${wrapper}" && test ! -L "${wrapper}"
+          test "$(HOME="${smoke_home}" "${wrapper}" --version)" = "${RELEASE_VERSION}"
+          HOME="${smoke_home}" "${wrapper}" --help >/dev/null
+          run_installer uninstall
+          test ! -e "${wrapper}" && test ! -L "${wrapper}"
+          test ! -e "${install_root}"
+          test "$(cat "${kept_data}")" = keep
+
+  smoke-windows:
+    needs: [preflight, publish-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            architecture: AMD64
+          - runner: windows-11-arm
+            architecture: ARM64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout installer source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Smoke public installer
+        shell: powershell
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ((git rev-parse HEAD).Trim() -ne $env:PUBLIC_COMMIT) { throw "Unexpected release commit" }
+          $architecture = $env:PROCESSOR_ARCHITEW6432
+          if ([String]::IsNullOrEmpty($architecture)) { $architecture = $env:PROCESSOR_ARCHITECTURE }
+          if ($architecture.ToUpperInvariant() -ne $env:EXPECTED_ARCHITECTURE) { throw "Unexpected runner architecture: $architecture" }
+
+          $actualUserProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+          if ([String]::IsNullOrWhiteSpace($actualUserProfile)) { throw "Unable to resolve the runner user profile" }
+          $smokeRoot = Join-Path $actualUserProfile ".yucode-public-installer-$([Guid]::NewGuid().ToString('N'))"
+          $userProfile = Join-Path $smokeRoot 'User'
+          $installer = Join-Path $smokeRoot 'install.ps1'
+          $env:USERPROFILE = $userProfile
+          $env:HOME = $userProfile
+          $env:LOCALAPPDATA = Join-Path $smokeRoot 'Local'
+          $env:APPDATA = Join-Path $smokeRoot 'Roaming'
+          $env:npm_config_prefix = Join-Path $env:APPDATA 'npm'
+          $env:Path = "$($env:npm_config_prefix);$($env:Path)"
+          $env:YUCODE_VERSION = $env:RELEASE_VERSION
+          $env:YUCODE_NO_MODIFY_PATH = '1'
+          New-Item -ItemType Directory -Force -Path $userProfile, $env:LOCALAPPDATA, $env:APPDATA | Out-Null
+          try {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:RELEASE_TAG/install.ps1" -OutFile $installer -UseBasicParsing
+            if ((Get-FileHash install.ps1 -Algorithm SHA256).Hash -ne (Get-FileHash $installer -Algorithm SHA256).Hash) {
+              throw "Downloaded installer does not match the release tag"
+            }
+
+            function Invoke-InstallerAction {
+              param([string]$Action)
+              if ($Action -eq 'install') {
+                Remove-Item Env:YUCODE_ACTION -ErrorAction SilentlyContinue
+              } else {
+                $env:YUCODE_ACTION = 'uninstall'
+              }
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
+              if ($LASTEXITCODE -ne 0) { throw "Installer action failed: $Action" }
+            }
+
+            $installRoot = Join-Path $env:LOCALAPPDATA 'Yusys\CodeMate'
+            $wrapper = Join-Path $installRoot 'bin\yucode.cmd'
+            Invoke-InstallerAction install
+            $reportedVersion = (& $wrapper --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne $env:RELEASE_VERSION) {
+              throw "Installed yucode reported an unexpected version"
+            }
+            & $wrapper --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Installed yucode help smoke failed" }
+            Invoke-InstallerAction install
+
+            $keptData = Join-Path $env:HOME '.yucode\agent\keep'
+            New-Item -ItemType Directory -Force -Path (Split-Path $keptData) | Out-Null
+            [IO.File]::WriteAllText($keptData, "keep`n", [Text.UTF8Encoding]::new($false))
+            Invoke-InstallerAction uninstall
+            if (Test-Path -LiteralPath $installRoot) { throw "Install root remains after uninstall" }
+            if ([IO.File]::ReadAllText($keptData).Trim() -ne 'keep') { throw "User data was removed" }
+
+            $fakePackage = Join-Path $smokeRoot 'npm-package'
+            $fakeBin = Join-Path $fakePackage 'bin'
+            New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
+            $fakeManifest = [ordered]@{
+              name = '@yusys-ai/yucode'
+              version = '0.0.0-smoke'
+              bin = [ordered]@{ yucode = 'bin/yucode.js' }
+            }
+            [IO.File]::WriteAllText(
+              (Join-Path $fakePackage 'package.json'),
+              (($fakeManifest | ConvertTo-Json) + "`n"),
+              [Text.UTF8Encoding]::new($false)
+            )
+            [IO.File]::WriteAllText(
+              (Join-Path $fakeBin 'yucode.js'),
+              "#!/usr/bin/env node`nconsole.log('npm smoke')`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            & npm pack $fakePackage --pack-destination $smokeRoot --ignore-scripts | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Unable to pack npm migration fixture" }
+            $fakeTgz = Join-Path $smokeRoot 'yusys-ai-yucode-0.0.0-smoke.tgz'
+            if (-not (Test-Path -LiteralPath $fakeTgz -PathType Leaf)) { throw "npm migration fixture is missing" }
+            & npm install -g $fakeTgz --ignore-scripts
+            if ($LASTEXITCODE -ne 0) { throw "Unable to install npm migration fixture" }
+            $npmRoot = (& npm root -g | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { throw "Unable to resolve npm migration root" }
+            $npmPackage = Join-Path $npmRoot '@yusys-ai\yucode'
+            if (-not (Test-Path -LiteralPath (Join-Path $npmPackage 'package.json') -PathType Leaf)) {
+              throw "npm migration fixture was not installed"
+            }
+
+            Invoke-InstallerAction install
+            if (Test-Path -LiteralPath $npmPackage) { throw "npm package remains after migration" }
+            if (-not (Test-Path -LiteralPath $wrapper -PathType Leaf)) { throw "Native wrapper is missing after migration" }
+            $reportedVersion = (& $wrapper --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne $env:RELEASE_VERSION) {
+              throw "Migrated yucode reported an unexpected version"
+            }
+            & $wrapper --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Migrated yucode help smoke failed" }
+
+            Invoke-InstallerAction uninstall
+            if (Test-Path -LiteralPath $installRoot) { throw "Install root remains after final uninstall" }
+            if ([IO.File]::ReadAllText($keptData).Trim() -ne 'keep') { throw "User data was removed" }
+          } finally {
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
