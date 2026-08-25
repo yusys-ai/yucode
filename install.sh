@@ -58,7 +58,7 @@ download() {
 
 read_manifest_version() {
 	LC_ALL=C awk -F '"' '
-		$2 == "version" { count++; version = $4 }
+		$1 == "\t" && $2 == "version" { count++; version = $4 }
 		END {
 			if (count != 1) exit 1
 			print version
@@ -68,7 +68,7 @@ read_manifest_version() {
 
 read_manifest_name() {
 	LC_ALL=C awk -F '"' '
-		$2 == "name" { count++; name = $4 }
+		$1 == "\t" && $2 == "name" { count++; name = $4 }
 		END {
 			if (count != 1) exit 1
 			print name
@@ -80,11 +80,19 @@ inspect_global_npm_install() {
 	NPM_INSTALL_STATUS=absent
 	NPM_INSTALL_REASON=
 	NPM_COMMAND=
+	NPM_NODE_COMMAND=
 	NPM_PREFIX=
 	NPM_ROOT=
 	NPM_PACKAGE_DIRECTORY=
+	NPM_PACKAGE_VERSION=
 	command -v npm >/dev/null 2>&1 || return 0
 	NPM_COMMAND="$(command -v npm)"
+	NPM_NODE_COMMAND="$(command -v node 2>/dev/null || true)"
+	if [ -z "$NPM_NODE_COMMAND" ]; then
+		NPM_INSTALL_STATUS=unsafe
+		NPM_INSTALL_REASON="Unable to resolve Node.js for the active global npm installation"
+		return 0
+	fi
 	if ! NPM_ROOT="$(npm root -g 2>/dev/null)" || ! NPM_PREFIX="$(npm prefix -g 2>/dev/null)"; then
 		NPM_INSTALL_STATUS=unsafe
 		NPM_INSTALL_REASON="Unable to resolve the active global npm installation"
@@ -119,10 +127,23 @@ inspect_global_npm_install() {
 		NPM_INSTALL_REASON="The global npm package path is not a regular package directory: $NPM_PACKAGE_DIRECTORY"
 		return 0
 	fi
-	package_name="$(read_manifest_name "$manifest" 2>/dev/null || true)"
+	package_name="$("$NPM_NODE_COMMAND" -e '
+		const manifest = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+		if (typeof manifest.name === "string") process.stdout.write(manifest.name);
+	' "$manifest" 2>/dev/null || true)"
 	if [ "$package_name" != "@yusys-ai/yucode" ]; then
 		NPM_INSTALL_STATUS=unsafe
 		NPM_INSTALL_REASON="The global npm package manifest is not @yusys-ai/yucode: $manifest"
+		return 0
+	fi
+	NPM_PACKAGE_VERSION="$("$NPM_NODE_COMMAND" -e '
+		const manifest = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+		if (typeof manifest.version === "string") process.stdout.write(manifest.version);
+	' "$manifest" 2>/dev/null || true)"
+	if printf '%s' "$NPM_PACKAGE_VERSION" | LC_ALL=C grep -q '[[:cntrl:]]' \
+		|| ! validate_version "$NPM_PACKAGE_VERSION"; then
+		NPM_INSTALL_STATUS=unsafe
+		NPM_INSTALL_REASON="The global npm package manifest has an invalid version: $manifest"
 		return 0
 	fi
 	NPM_INSTALL_STATUS=verified
@@ -354,7 +375,7 @@ configure_path() {
 				[ -f "$STATE_DIRECTORY/path-file" ] || fail "Managed PATH state is incomplete"
 				profile="$(sed -n '1p' "$STATE_DIRECTORY/path-file")"
 				known_profile "$profile" || fail "Managed PATH state contains an unexpected profile"
-				[ ! -L "$profile" ] || fail "Shell profile is a symbolic link and was not modified: $profile. Set YUCODE_NO_MODIFY_PATH=1 and add $BIN_DIRECTORY to PATH manually."
+				[ ! -L "$profile" ] || fail "Shell profile is a symbolic link and was not modified: $profile. Rerun with --no-modify-path and add $BIN_DIRECTORY to PATH manually."
 				if ! managed_profile_block "$profile"; then
 					fail "Managed PATH block was modified: $profile"
 				fi
@@ -376,7 +397,7 @@ configure_path() {
 			return
 			;;
 	esac
-	if [ "${YUCODE_NO_MODIFY_PATH:-0}" = "1" ]; then
+	if [ "$NO_MODIFY_PATH" = "1" ]; then
 		write_state path-kind none
 		return
 	fi
@@ -403,7 +424,7 @@ configure_path() {
 			;;
 		*) profile="$HOME/.profile" ;;
 	esac
-	[ ! -L "$profile" ] || fail "Shell profile is a symbolic link and was not modified: $profile. Set YUCODE_NO_MODIFY_PATH=1 and add $BIN_DIRECTORY to PATH manually."
+	[ ! -L "$profile" ] || fail "Shell profile is a symbolic link and was not modified: $profile. Rerun with --no-modify-path and add $BIN_DIRECTORY to PATH manually."
 	if [ -e "$profile" ] && [ ! -f "$profile" ]; then
 		fail "Shell profile is not a regular file: $profile"
 	fi
@@ -544,8 +565,8 @@ detect_platform() {
 }
 
 resolve_version() {
-	if [ -n "${YUCODE_VERSION:-}" ]; then
-		VERSION="$YUCODE_VERSION"
+	if [ -n "$VERSION_OVERRIDE" ]; then
+		VERSION="$VERSION_OVERRIDE"
 	else
 		channel_file="$STAGING_DIRECTORY/channel"
 		download "$RAW_BASE/channels/$CHANNEL" "$channel_file"
@@ -631,8 +652,71 @@ migrate_global_npm_install() {
 	info "Removed the global npm installation of @yusys-ai/yucode."
 }
 
+remove_superseded_versions() {
+	has_superseded_entry=0
+	for version_path in "$VERSIONS_DIRECTORY"/* "$VERSIONS_DIRECTORY"/.[!.]* "$VERSIONS_DIRECTORY"/..?*; do
+		if [ ! -e "$version_path" ] && [ ! -L "$version_path" ]; then continue; fi
+		[ "${version_path##*/}" = "$VERSION" ] || has_superseded_entry=1
+	done
+	[ "$has_superseded_entry" = "1" ] || return 0
+
+	if ! command -v pgrep >/dev/null 2>&1; then
+		info "Warning: superseded versions were kept because running yucode processes could not be checked."
+		return 0
+	fi
+	if pgrep -x yucode >/dev/null 2>&1; then
+		info "Superseded versions were kept because a yucode process is still running."
+		return 0
+	else
+		pgrep_status=$?
+		if [ "$pgrep_status" -ne 1 ]; then
+			info "Warning: superseded versions were kept because running yucode processes could not be checked."
+			return 0
+		fi
+	fi
+
+	validate_install_paths
+	[ -d "$VERSIONS_DIRECTORY" ] && [ ! -L "$VERSIONS_DIRECTORY" ] \
+		|| fail "Managed versions path is not a regular directory: $VERSIONS_DIRECTORY"
+	for version_path in "$VERSIONS_DIRECTORY"/* "$VERSIONS_DIRECTORY"/.[!.]* "$VERSIONS_DIRECTORY"/..?*; do
+		if [ ! -e "$version_path" ] && [ ! -L "$version_path" ]; then continue; fi
+		version_name="${version_path##*/}"
+		if printf '%s' "$version_name" | LC_ALL=C grep -q '[[:cntrl:]]' \
+			|| ! validate_version "$version_name"; then
+			fail "Unexpected entry in managed versions directory: $version_path"
+		fi
+		user_path_has_no_symlinks "$version_path" \
+			|| fail "Managed version path passes through a symbolic link: $version_path"
+		[ -d "$version_path" ] && [ ! -L "$version_path" ] \
+			|| fail "Managed version path is not a regular directory: $version_path"
+	done
+
+	for version_path in "$VERSIONS_DIRECTORY"/* "$VERSIONS_DIRECTORY"/.[!.]* "$VERSIONS_DIRECTORY"/..?*; do
+		if [ ! -e "$version_path" ] && [ ! -L "$version_path" ]; then continue; fi
+		version_name="${version_path##*/}"
+		if printf '%s' "$version_name" | LC_ALL=C grep -q '[[:cntrl:]]' \
+			|| ! validate_version "$version_name"; then
+			fail "Unexpected entry in managed versions directory: $version_path"
+		fi
+		user_path_has_no_symlinks "$version_path" \
+			|| fail "Managed version path passes through a symbolic link: $version_path"
+		[ -d "$version_path" ] && [ ! -L "$version_path" ] \
+			|| fail "Managed version path is not a regular directory: $version_path"
+		[ "$version_name" = "$VERSION" ] && continue
+		rm -rf "$version_path" || fail "Unable to remove superseded version: $version_name"
+		info "Removed superseded version $version_name."
+	done
+}
+
 uninstall() {
 	validate_install_paths
+	if [ "$PURGE" = "1" ]; then
+		user_path_has_no_symlinks "$USER_DATA_DIRECTORY" || fail "User data path passes through a symbolic link: $USER_DATA_DIRECTORY"
+		if [ -e "$USER_DATA_DIRECTORY" ] || [ -L "$USER_DATA_DIRECTORY" ]; then
+			[ -d "$USER_DATA_DIRECTORY" ] && [ ! -L "$USER_DATA_DIRECTORY" ] \
+				|| fail "User data path is not a regular directory: $USER_DATA_DIRECTORY"
+		fi
+	fi
 	wrapper_version=
 	if [ -e "$INSTALL_ROOT" ] || [ -L "$INSTALL_ROOT" ]; then
 		[ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] || fail "Refusing to remove an unmanaged path: $INSTALL_ROOT"
@@ -653,7 +737,12 @@ uninstall() {
 	validate_install_paths
 	if [ -e "$WRAPPER" ]; then rm -f "$WRAPPER"; fi
 	if [ -d "$INSTALL_ROOT" ]; then rm -rf "$INSTALL_ROOT"; fi
-	info "$PRODUCT was uninstalled. User data under $HOME/.yucode was kept."
+	if [ "$PURGE" = "1" ]; then
+		if [ -d "$USER_DATA_DIRECTORY" ]; then rm -rf "$USER_DATA_DIRECTORY"; fi
+		info "$PRODUCT was uninstalled. User data under $USER_DATA_DIRECTORY was removed."
+	else
+		info "$PRODUCT was uninstalled. User data under $USER_DATA_DIRECTORY was kept."
+	fi
 }
 
 install() {
@@ -680,10 +769,7 @@ install() {
 	validate_install_paths
 	validate_state_files
 	write_state managed 1
-	if [ -z "${YUCODE_CHANNEL:-}" ] && [ -f "$STATE_DIRECTORY/channel" ]; then
-		CHANNEL="$(sed -n '1p' "$STATE_DIRECTORY/channel")"
-	fi
-	case "$CHANNEL" in default | stable | rc) ;; *) fail "Invalid channel: $CHANNEL" ;; esac
+	case "$CHANNEL" in default | rc) ;; *) fail "Invalid release selection: $CHANNEL" ;; esac
 	validate_install_paths
 	STAGING_DIRECTORY="$(mktemp -d "$INSTALL_ROOT/.staging.XXXXXX")"
 	user_path_has_no_symlinks "$STAGING_DIRECTORY" || fail "Staging path passes through a symbolic link: $STAGING_DIRECTORY"
@@ -692,8 +778,15 @@ install() {
 		current_version="$(sed -n '1p' "$STATE_DIRECTORY/version")"
 		validate_version "$current_version" || fail "Installed version state is invalid"
 		comparison="$(compare_versions "$VERSION" "$current_version")"
-		if [ "$comparison" -lt 0 ] && [ "${YUCODE_ALLOW_DOWNGRADE:-0}" != "1" ]; then
-			fail "Refusing to downgrade from $current_version to $VERSION; set YUCODE_ALLOW_DOWNGRADE=1 to override"
+		if [ "$comparison" -lt 0 ]; then
+			fail "Refusing to downgrade from $current_version to $VERSION; downgrades are not supported"
+		fi
+	fi
+	inspect_global_npm_install
+	if [ "$NPM_INSTALL_STATUS" = "verified" ]; then
+		comparison="$(compare_versions "$VERSION" "$NPM_PACKAGE_VERSION")"
+		if [ "$comparison" -lt 0 ]; then
+			fail "Refusing to downgrade from $NPM_PACKAGE_VERSION to $VERSION; downgrades are not supported"
 		fi
 	fi
 	version_directory="$VERSIONS_DIRECTORY/$VERSION"
@@ -759,23 +852,54 @@ esac
 if printf '%s' "$HOME" | LC_ALL=C grep -q '[[:cntrl:]]'; then fail "HOME contains unsupported characters"; fi
 [ -d "$HOME" ] && [ ! -L "$HOME" ] || fail "HOME must be a directory and must not be a symbolic link"
 
-ACTION="${YUCODE_ACTION:-install}"
-if [ "$#" -gt 1 ]; then fail "Usage: install.sh [install|uninstall]"; fi
-if [ "$#" -eq 1 ]; then ACTION="$1"; fi
-case "$ACTION" in install | uninstall) ;; *) fail "Invalid action: $ACTION" ;; esac
-case "${YUCODE_NO_MODIFY_PATH:-0}" in 0 | 1) ;; *) fail "YUCODE_NO_MODIFY_PATH must be 0 or 1" ;; esac
-case "${YUCODE_ALLOW_DOWNGRADE:-0}" in 0 | 1) ;; *) fail "YUCODE_ALLOW_DOWNGRADE must be 0 or 1" ;; esac
+ACTION=install
+CHANNEL=default
+VERSION_OVERRIDE=
+NO_MODIFY_PATH=0
+PURGE=0
+SELECTION=default
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--preview)
+			[ "$SELECTION" = "default" ] || fail "--preview cannot be combined with another release selection"
+			SELECTION=preview
+			CHANNEL=rc
+			;;
+		--version)
+			[ "$SELECTION" = "default" ] || fail "--version cannot be combined with another release selection"
+			[ "$#" -ge 2 ] || fail "--version requires a value"
+			case "$2" in --*) fail "--version requires a value" ;; esac
+			SELECTION=exact
+			VERSION_OVERRIDE="$2"
+			shift
+			;;
+		--uninstall) ACTION=uninstall ;;
+		--purge) PURGE=1 ;;
+		--no-modify-path) NO_MODIFY_PATH=1 ;;
+		*) fail "Unknown argument: $1" ;;
+	esac
+	shift
+done
+if [ "$SELECTION" = "exact" ]; then
+	validate_version "$VERSION_OVERRIDE" || fail "Invalid release version: $VERSION_OVERRIDE"
+fi
+if [ "$ACTION" = "uninstall" ]; then
+	[ "$SELECTION" = "default" ] || fail "--uninstall cannot be combined with --preview or --version"
+	[ "$NO_MODIFY_PATH" = "0" ] || fail "--no-modify-path is only valid when installing"
+else
+	[ "$PURGE" = "0" ] || fail "--purge requires --uninstall"
+fi
 
 INSTALL_ROOT="$HOME/.local/share/yucode"
 STATE_DIRECTORY="$INSTALL_ROOT/state"
 VERSIONS_DIRECTORY="$INSTALL_ROOT/versions"
 BIN_DIRECTORY="$HOME/.local/bin"
 WRAPPER="$BIN_DIRECTORY/yucode"
+USER_DATA_DIRECTORY="$HOME/.yucode"
 LOCK_PARENT="$HOME/.local/share"
 LOCK_DIRECTORY="$LOCK_PARENT/.yucode-install-lock"
 LOCK_HELD=0
 STAGING_DIRECTORY=
-CHANNEL="${YUCODE_CHANNEL:-default}"
 
 validate_install_paths
 user_path_has_no_symlinks "$LOCK_DIRECTORY" || fail "Installer lock path passes through a symbolic link: $LOCK_DIRECTORY"
@@ -799,6 +923,7 @@ else
 	require_command tar
 	install
 	migrate_global_npm_install
+	remove_superseded_versions
 	info "$PRODUCT $VERSION is installed."
 	resolved_command="$(command -v yucode 2>/dev/null || true)"
 	if [ -n "$resolved_command" ] && [ "$resolved_command" != "$WRAPPER" ]; then

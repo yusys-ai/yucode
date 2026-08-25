@@ -33,15 +33,13 @@ version is already installed.
 On macOS or Linux, uninstall with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | YUCODE_ACTION=uninstall sh
+curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | sh -s -- --uninstall
 ```
 
 On Windows, uninstall with:
 
 ```powershell
-$env:YUCODE_ACTION = 'uninstall'
-irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1 | iex
-Remove-Item Env:YUCODE_ACTION
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1))) '--uninstall'
 ```
 
 During `install`, the native release is installed and verified before a
@@ -50,20 +48,50 @@ System-level and ambiguous npm installations are never removed and are reported
 with manual guidance.
 
 Uninstall removes only installer-managed binaries, state, and PATH entries.
-User data under `~/.yucode` is kept.
+User data under `~/.yucode` is kept. Add `--purge` to the uninstall command to
+remove it as well:
 
-## Release channels
+```sh
+curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | sh -s -- --uninstall --purge
+```
 
-New installations use the `default` channel. Before the first stable release,
-`default` follows `rc`; afterward it follows `stable`. Set
-`YUCODE_CHANNEL=stable` or `YUCODE_CHANNEL=rc` before running the installer to
-select another channel, or set `YUCODE_VERSION` to install an exact version.
-Repeated installs retain the installed channel. After a release candidate
-becomes stable, the `rc` channel advances to that stable version so prerelease
-users can graduate by rerunning the installer.
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1))) '--uninstall' '--purge'
+```
 
-Downgrades are rejected unless `YUCODE_ALLOW_DOWNGRADE=1` is set. Set
-`YUCODE_NO_MODIFY_PATH=1` to manage PATH yourself.
+## Release selection
+
+With no arguments, the installer selects the latest stable release. If no
+stable release exists, it selects the latest release candidate. `--preview`
+selects whichever available stable or release-candidate version is newer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | sh -s -- --preview
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1))) '--preview'
+```
+
+Use `--version <version>` to install any exact public stable or release-candidate
+version that is not older than the installed version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | sh -s -- --version 0.842.0-rc1
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1))) '--version' '0.842.0-rc1'
+```
+
+Each run selects from its current arguments; an earlier preview installation
+does not change later no-argument behavior.
+
+Reinstalling the same version is idempotent. Downgrades are not supported. If a
+preview is newer than the current stable release, use `--preview` or a newer
+exact release until stable catches up. Use `--no-modify-path` to manage PATH
+yourself. After a successful update, superseded installer-managed versions are
+removed when no `yucode` process is running.
 
 ## npm
 
