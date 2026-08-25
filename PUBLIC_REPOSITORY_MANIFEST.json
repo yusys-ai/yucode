@@ -5,8 +5,8 @@
 	"files": [
 		{
 			"path": ".github/workflows/publish.yml",
-			"size": 54773,
-			"sha256": "72f4c8103929afad2a4ba096f261c91c3d1ba79a31764576c83baf6914d4672e"
+			"size": 69955,
+			"sha256": "351b69bf2389115b8d891ed6c6a4b67c4ed6ccdf99c2ca29045c12c8d32efcac"
 		},
 		{
 			"path": "CHANGELOG.md",

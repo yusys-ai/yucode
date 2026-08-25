@@ -39,7 +39,7 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     outputs:
       checksums_sha256: ${{ steps.release.outputs.checksums_sha256 }}
       kind: ${{ steps.release.outputs.kind }}
@@ -404,13 +404,13 @@ jobs:
             echo "version=${version}"
           } >> "${GITHUB_OUTPUT}"
 
-  publish-npm:
+  publish-npm-platforms:
     if: needs.preflight.outputs.kind == 'stable'
     needs: preflight
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - name: Checkout release metadata
@@ -595,14 +595,13 @@ jobs:
           cmp package.json release/launcher-package.json
           cmp bin/yucode-launcher.mjs release/yucode-launcher.mjs
 
-          : > release/publication-order.tsv
+          : > release/platform-publication-order.tsv
           while IFS= read -r package_name; do
-            awk -F '\t' -v name="${package_name}" '$1 == name' release/validated-packages.tsv >> release/publication-order.tsv
+            awk -F '\t' -v name="${package_name}" '$1 == name' release/validated-packages.tsv >> release/platform-publication-order.tsv
           done < release/platform-packages
-          awk -F '\t' '$1 == "@yusys-ai/yucode"' release/validated-packages.tsv >> release/publication-order.tsv
-          test "$(wc -l < release/publication-order.tsv)" -eq 7
+          test "$(wc -l < release/platform-publication-order.tsv)" -eq 6
 
-      - name: Publish exact release package set
+      - name: Publish exact platform package set
         run: |
           set -euo pipefail
           export LC_ALL=C
@@ -681,7 +680,7 @@ jobs:
                 "${package_name}" "${package_version}" "${package_file}" "${package_integrity}" "${package_shasum}" \
                 >> release/publication-plan.tsv
             fi
-          done < release/publication-order.tsv
+          done < release/platform-publication-order.tsv
 
           while IFS=$'\t' read -r package_name package_version package_file package_integrity package_shasum; do
             npm publish "./release/${package_file}" \
@@ -714,14 +713,324 @@ jobs:
             test "$(jq -r .shasum <<<"${published_dist}")" = "${package_shasum}"
             dist_tags="$(read_dist_tags "${package_name}")"
             test "$(jq -r '.latest // empty' <<<"${dist_tags}")" = "${package_version}"
-          done < release/publication-order.tsv
+          done < release/platform-publication-order.tsv
+
+  smoke-npm-platforms:
+    name: Smoke npm ${{ matrix.platform }}
+    if: needs.preflight.outputs.kind == 'stable'
+    needs: [preflight, publish-npm-platforms]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin-arm64
+            package: '@yusys-ai/roche-darwin-arm64'
+          - runner: macos-15-intel
+            platform: darwin-x64
+            package: '@yusys-ai/roche-darwin-x64'
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            package: '@yusys-ai/roche-linux-arm64'
+          - runner: ubuntu-24.04
+            platform: linux-x64
+            package: '@yusys-ai/roche-linux-x64'
+          - runner: windows-11-arm
+            platform: windows-arm64
+            package: '@yusys-ai/roche-windows-arm64'
+          - runner: windows-2025
+            platform: windows-x64
+            package: '@yusys-ai/roche-windows-x64'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      PLATFORM_PACKAGE: ${{ matrix.package }}
+      RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install and smoke exact platform package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_root="${RUNNER_TEMP}/yucode-npm-registry-smoke"
+          installed=false
+          for _ in {1..12}; do
+            rm -rf "${smoke_root}"
+            mkdir -p "${smoke_root}"
+            if npm install \
+              --prefix "${smoke_root}" \
+              --ignore-scripts \
+              --omit=dev \
+              --package-lock=false \
+              --no-save \
+              --prefer-online \
+              --registry=https://registry.npmjs.org \
+              "${PLATFORM_PACKAGE}@${RELEASE_VERSION}"; then
+              installed=true
+              break
+            fi
+            sleep 5
+          done
+          test "${installed}" = true
+
+          binary="${smoke_root}/node_modules/${PLATFORM_PACKAGE}/bin/yucode"
+          test -x "${binary}"
+          test "$("${binary}" --version)" = "${RELEASE_VERSION}"
+          "${binary}" --help >/dev/null
+          "${binary}" --list-models >/dev/null
+
+      - name: Install and smoke exact platform package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "yucode-npm-registry-smoke"
+          $installed = $false
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+            & npm install `
+              --prefix $smokeRoot `
+              --ignore-scripts `
+              --omit=dev `
+              --package-lock=false `
+              --no-save `
+              --prefer-online `
+              --registry=https://registry.npmjs.org `
+              "$env:PLATFORM_PACKAGE@$env:RELEASE_VERSION"
+            if ($LASTEXITCODE -eq 0) {
+              $installed = $true
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $installed) { throw "Unable to install the exact platform package from npm" }
+
+          $binary = Join-Path $smokeRoot "node_modules/$($env:PLATFORM_PACKAGE)/bin/yucode.exe"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Installed platform binary is missing" }
+          $reportedVersion = (& $binary --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne $env:RELEASE_VERSION) {
+            throw "Installed platform binary reported an unexpected version"
+          }
+          & $binary --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Installed platform binary help smoke failed" }
+          & $binary --list-models | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Installed platform binary model listing failed" }
+
+  publish-npm-launcher:
+    if: needs.preflight.outputs.kind == 'stable'
+    needs: [preflight, smoke-npm-platforms]
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout release metadata
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Verify release commit
+        env:
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+        run: test "$(git rev-parse HEAD)" = "${PUBLIC_COMMIT}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download exact release packages
+        env:
+          CHECKSUMS_SHA256: ${{ needs.preflight.outputs.checksums_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.preflight.outputs.release_id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          verification="$(mktemp -d)"
+          trap 'rm -rf "${verification}"' EXIT
+          mkdir release
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "${verification}/release.json"
+          test "$(jq -r '.id | tostring' "${verification}/release.json")" = "${RELEASE_ID}"
+          test "$(jq -r .tag_name "${verification}/release.json")" = "${RELEASE_TAG}"
+          while IFS=$'\t' read -r asset_id filename; do
+            [[ "${asset_id}" =~ ^[1-9][0-9]*$ ]]
+            [[ "${filename}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "release/${filename}"
+          done < <(jq -r '.assets[] | [(.id | tostring), .name] | @tsv' "${verification}/release.json")
+          test "$(sha256sum release/SHA256SUMS | awk '{print $1}')" = "${CHECKSUMS_SHA256}"
+          awk '{print $2}' release/SHA256SUMS | sort > "${verification}/expected-assets"
+          printf '%s\n' SHA256SUMS >> "${verification}/expected-assets"
+          sort -o "${verification}/expected-assets" "${verification}/expected-assets"
+          find release -maxdepth 1 -type f -exec basename {} \; | sort > "${verification}/actual-assets"
+          diff -u "${verification}/expected-assets" "${verification}/actual-assets"
+          (
+            cd release
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@11.16.0 --ignore-scripts
+          test "$(npm --version)" = 11.16.0
+
+      - name: Verify platforms and publish exact launcher
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          version="${RELEASE_TAG#v}"
+          test "$(jq -r .version release/release-manifest.json)" = "${version}"
+
+          printf '%s\n' \
+            @yusys-ai/roche-darwin-arm64 \
+            @yusys-ai/roche-darwin-x64 \
+            @yusys-ai/roche-linux-arm64 \
+            @yusys-ai/roche-linux-x64 \
+            @yusys-ai/roche-windows-arm64 \
+            @yusys-ai/roche-windows-x64 | sort > release/platform-packages
+          launcher_entry="$(jq -ce '.packages[] | select(.name == "@yusys-ai/yucode")' release/release-manifest.json)"
+          launcher_file="$(jq -r .file <<<"${launcher_entry}")"
+          launcher_integrity="$(jq -r .integrity <<<"${launcher_entry}")"
+          launcher_shasum="$(jq -r .shasum <<<"${launcher_entry}")"
+          launcher_path="release/${launcher_file}"
+          test "$(jq -r .version <<<"${launcher_entry}")" = "${version}"
+          test "$(stat -c %s "${launcher_path}")" = "$(jq -r .size <<<"${launcher_entry}")"
+          test "$(sha1sum "${launcher_path}" | awk '{print $1}')" = "${launcher_shasum}"
+          test "sha512-$(openssl dgst -sha512 -binary "${launcher_path}" | openssl base64 -A)" = "${launcher_integrity}"
+
+          launcher_json="$(tar -xOzf "${launcher_path}" package/package.json)"
+          test "$(jq -r .name <<<"${launcher_json}")" = @yusys-ai/yucode
+          test "$(jq -r .version <<<"${launcher_json}")" = "${version}"
+          test "$(jq -c '.optionalDependencies | keys' <<<"${launcher_json}")" = "$(jq -Rsc 'split("\n") | map(select(length > 0)) | sort' release/platform-packages)"
+          while IFS= read -r platform_package; do
+            test "$(jq -r --arg name "${platform_package}" '.optionalDependencies[$name]' <<<"${launcher_json}")" = "${version}"
+          done < release/platform-packages
+
+          read_registry_dist() {
+            local package_spec="$1"
+            local normalized
+            if npm view "${package_spec}" dist --json > "${RUNNER_TEMP}/npm-view.json" 2> "${RUNNER_TEMP}/npm-view.err"; then
+              if ! normalized="$(jq -ce '
+                (if type == "object" then . elif type == "array" and length == 1 then .[0] else empty end) |
+                select(type == "object" and (.integrity | type) == "string" and (.shasum | type) == "string")
+              ' "${RUNNER_TEMP}/npm-view.json")"; then
+                cat "${RUNNER_TEMP}/npm-view.json" >&2
+                return 1
+              fi
+              printf '%s\n' "${normalized}"
+              return 0
+            fi
+            if grep -Eq '"code"[[:space:]]*:[[:space:]]*"E404"|npm (error|ERR!) code E404' \
+              "${RUNNER_TEMP}/npm-view.json" "${RUNNER_TEMP}/npm-view.err"; then
+              return 44
+            fi
+            cat "${RUNNER_TEMP}/npm-view.json" "${RUNNER_TEMP}/npm-view.err" >&2
+            return 1
+          }
+
+          read_dist_tags() {
+            local package_name="$1"
+            local normalized
+            if ! npm view "${package_name}" dist-tags --json > "${RUNNER_TEMP}/npm-tags.json" 2> "${RUNNER_TEMP}/npm-tags.err"; then
+              cat "${RUNNER_TEMP}/npm-tags.json" "${RUNNER_TEMP}/npm-tags.err" >&2
+              return 1
+            fi
+            if ! normalized="$(jq -ce '
+              if type == "object" then . elif type == "array" and length == 1 and (.[0] | type) == "object" then .[0] else empty end
+            ' "${RUNNER_TEMP}/npm-tags.json")"; then
+              cat "${RUNNER_TEMP}/npm-tags.json" >&2
+              return 1
+            fi
+            printf '%s\n' "${normalized}"
+          }
+
+          version_is_greater() {
+            local left="$1"
+            local right="$2"
+            local left_parts right_parts index
+            [[ "${left}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            [[ "${right}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            IFS=. read -r -a left_parts <<<"${left}"
+            IFS=. read -r -a right_parts <<<"${right}"
+            for index in 0 1 2; do
+              if ((${#left_parts[index]} > ${#right_parts[index]})); then return 0; fi
+              if ((${#left_parts[index]} < ${#right_parts[index]})); then return 1; fi
+              if [[ "${left_parts[index]}" > "${right_parts[index]}" ]]; then return 0; fi
+              if [[ "${left_parts[index]}" < "${right_parts[index]}" ]]; then return 1; fi
+            done
+            return 1
+          }
+
+          while IFS= read -r platform_package; do
+            entry="$(jq -ce --arg name "${platform_package}" '.packages[] | select(.name == $name)' release/release-manifest.json)"
+            published_dist="$(read_registry_dist "${platform_package}@${version}")"
+            test "$(jq -r .integrity <<<"${published_dist}")" = "$(jq -r .integrity <<<"${entry}")"
+            test "$(jq -r .shasum <<<"${published_dist}")" = "$(jq -r .shasum <<<"${entry}")"
+            dist_tags="$(read_dist_tags "${platform_package}")"
+            test "$(jq -r '.latest // empty' <<<"${dist_tags}")" = "${version}"
+          done < release/platform-packages
+
+          if published_dist="$(read_registry_dist "@yusys-ai/yucode@${version}")"; then
+            test "$(jq -r .integrity <<<"${published_dist}")" = "${launcher_integrity}"
+            test "$(jq -r .shasum <<<"${published_dist}")" = "${launcher_shasum}"
+            dist_tags="$(read_dist_tags @yusys-ai/yucode)"
+            test "$(jq -r '.latest // empty' <<<"${dist_tags}")" = "${version}"
+          else
+            status=$?
+            test "${status}" -eq 44
+            dist_tags="$(read_dist_tags @yusys-ai/yucode)"
+            current_latest="$(jq -r '.latest // empty' <<<"${dist_tags}")"
+            if [[ -n "${current_latest}" ]]; then
+              version_is_greater "${version}" "${current_latest}"
+            fi
+
+            npm publish "./${launcher_path}" \
+              --access public \
+              --provenance \
+              --tag latest \
+              --ignore-scripts
+          fi
+
+          published=false
+          for _ in {1..12}; do
+            if published_dist="$(read_registry_dist "@yusys-ai/yucode@${version}")"; then
+              test "$(jq -r .integrity <<<"${published_dist}")" = "${launcher_integrity}"
+              test "$(jq -r .shasum <<<"${published_dist}")" = "${launcher_shasum}"
+              dist_tags="$(read_dist_tags @yusys-ai/yucode)"
+              if [[ "$(jq -r '.latest // empty' <<<"${dist_tags}")" == "${version}" ]]; then
+                published=true
+                break
+              fi
+            else
+              status=$?
+              test "${status}" -eq 44
+            fi
+            sleep 5
+          done
+          test "${published}" = true
 
   publish-release:
     if: >-
       always() &&
+      !cancelled() &&
       needs.preflight.result == 'success' &&
-      (needs.preflight.outputs.kind == 'rc' || needs.publish-npm.result == 'success')
-    needs: [preflight, publish-npm]
+      (needs.preflight.outputs.kind == 'rc' || needs.publish-npm-launcher.result == 'success')
+    needs: [preflight, publish-npm-launcher]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -809,6 +1118,11 @@ jobs:
           test "$(jq -r '.published_at | type' "${verification}/published-release.json")" = string
 
   smoke-unix:
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.preflight.result == 'success' &&
+      needs.publish-release.result == 'success'
     needs: [preflight, publish-release]
     strategy:
       fail-fast: false
@@ -859,37 +1173,28 @@ jobs:
           cmp install.sh "${downloaded_installer}"
 
           run_installer() {
-            if [[ "$1" == install ]]; then
-              HOME="${smoke_home}" \
-              PATH="${smoke_home}/.local/bin:${PATH}" \
-              SHELL=/bin/sh \
-              npm_config_prefix="${smoke_home}/.local" \
-              YUCODE_NO_MODIFY_PATH=1 \
-              YUCODE_VERSION="${RELEASE_VERSION}" \
-                sh "${downloaded_installer}"
-            else
-              HOME="${smoke_home}" \
-              PATH="${smoke_home}/.local/bin:${PATH}" \
-              SHELL=/bin/sh \
-              npm_config_prefix="${smoke_home}/.local" \
-              YUCODE_ACTION=uninstall \
-              YUCODE_NO_MODIFY_PATH=1 \
-              YUCODE_VERSION="${RELEASE_VERSION}" \
-                sh "${downloaded_installer}"
-            fi
+            HOME="${smoke_home}" \
+            PATH="${smoke_home}/.local/bin:${PATH}" \
+            SHELL=/bin/sh \
+            npm_config_prefix="${smoke_home}/.local" \
+              sh "${downloaded_installer}" "$@"
           }
 
           wrapper="${smoke_home}/.local/bin/yucode"
           install_root="${smoke_home}/.local/share/yucode"
-          run_installer install
+          run_installer --version "${RELEASE_VERSION}" --no-modify-path
           test "$(HOME="${smoke_home}" "${wrapper}" --version)" = "${RELEASE_VERSION}"
           HOME="${smoke_home}" "${wrapper}" --help >/dev/null
-          run_installer install
+
+          superseded_directory="${install_root}/versions/0.0.0"
+          mkdir "${superseded_directory}"
+          run_installer --version "${RELEASE_VERSION}" --no-modify-path
+          test ! -e "${superseded_directory}" && test ! -L "${superseded_directory}"
 
           kept_data="${smoke_home}/.yucode/agent/keep"
           mkdir -p "$(dirname "${kept_data}")"
           printf '%s\n' keep > "${kept_data}"
-          run_installer uninstall
+          run_installer --uninstall
           test ! -e "${wrapper}" && test ! -L "${wrapper}"
           test ! -e "${install_root}"
           test "$(cat "${kept_data}")" = keep
@@ -899,14 +1204,14 @@ jobs:
           printf '%s\n' \
             '{' \
             '  "name": "@yusys-ai/yucode",' \
-            '  "version": "0.0.0-smoke",' \
+            '  "version": "0.0.0",' \
             '  "bin": { "yucode": "bin/yucode.js" }' \
             '}' > "${fake_package}/package.json"
           printf '%s\n' '#!/usr/bin/env node' 'console.log("npm smoke")' > "${fake_package}/bin/yucode.js"
           chmod 755 "${fake_package}/bin/yucode.js"
           HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" \
             npm pack "${fake_package}" --pack-destination "${smoke_root}" --ignore-scripts >/dev/null
-          fake_tgz="${smoke_root}/yusys-ai-yucode-0.0.0-smoke.tgz"
+          fake_tgz="${smoke_root}/yusys-ai-yucode-0.0.0.tgz"
           test -f "${fake_tgz}"
           HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" \
             npm install -g "${fake_tgz}" --ignore-scripts
@@ -914,17 +1219,22 @@ jobs:
           test -f "${npm_root}/@yusys-ai/yucode/package.json"
           test -e "${wrapper}" || test -L "${wrapper}"
 
-          run_installer install
+          run_installer --version "${RELEASE_VERSION}" --no-modify-path
           test ! -e "${npm_root}/@yusys-ai/yucode" && test ! -L "${npm_root}/@yusys-ai/yucode"
           test -f "${wrapper}" && test ! -L "${wrapper}"
           test "$(HOME="${smoke_home}" "${wrapper}" --version)" = "${RELEASE_VERSION}"
           HOME="${smoke_home}" "${wrapper}" --help >/dev/null
-          run_installer uninstall
+          run_installer --uninstall --purge
           test ! -e "${wrapper}" && test ! -L "${wrapper}"
           test ! -e "${install_root}"
-          test "$(cat "${kept_data}")" = keep
+          test ! -e "${smoke_home}/.yucode" && test ! -L "${smoke_home}/.yucode"
 
   smoke-windows:
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.preflight.result == 'success' &&
+      needs.publish-release.result == 'success'
     needs: [preflight, publish-release]
     strategy:
       fail-fast: false
@@ -969,8 +1279,6 @@ jobs:
           $env:APPDATA = Join-Path $smokeRoot 'Roaming'
           $env:npm_config_prefix = Join-Path $env:APPDATA 'npm'
           $env:Path = "$($env:npm_config_prefix);$($env:Path)"
-          $env:YUCODE_VERSION = $env:RELEASE_VERSION
-          $env:YUCODE_NO_MODIFY_PATH = '1'
           New-Item -ItemType Directory -Force -Path $userProfile, $env:LOCALAPPDATA, $env:APPDATA | Out-Null
           try {
             Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:RELEASE_TAG/install.ps1" -OutFile $installer -UseBasicParsing
@@ -979,31 +1287,43 @@ jobs:
             }
 
             function Invoke-InstallerAction {
-              param([string]$Action)
-              if ($Action -eq 'install') {
-                Remove-Item Env:YUCODE_ACTION -ErrorAction SilentlyContinue
-              } else {
-                $env:YUCODE_ACTION = 'uninstall'
-              }
-              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
-              if ($LASTEXITCODE -ne 0) { throw "Installer action failed: $Action" }
+              param([string[]]$InstallerArguments)
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer @InstallerArguments
+              if ($LASTEXITCODE -ne 0) { throw "Installer action failed: $($InstallerArguments -join ' ')" }
             }
 
             $installRoot = Join-Path $env:LOCALAPPDATA 'Yusys\CodeMate'
             $wrapper = Join-Path $installRoot 'bin\yucode.cmd'
-            Invoke-InstallerAction install
+            $partialStateDirectory = Join-Path $installRoot 'state'
+            New-Item -ItemType Directory -Force -Path $partialStateDirectory, (Join-Path $installRoot 'versions'), (Join-Path $installRoot 'bin') | Out-Null
+            [IO.File]::WriteAllText((Join-Path $partialStateDirectory 'managed'), "1`n", [Text.UTF8Encoding]::new($false))
+            Invoke-InstallerAction -InstallerArguments @('--uninstall')
+            if (Test-Path -LiteralPath $installRoot) { throw "Partial install root remains after uninstall" }
+
+            Invoke-InstallerAction -InstallerArguments @('--version', $env:RELEASE_VERSION, '--no-modify-path')
             $reportedVersion = (& $wrapper --version | Out-String).Trim()
             if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne $env:RELEASE_VERSION) {
               throw "Installed yucode reported an unexpected version"
             }
             & $wrapper --help | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Installed yucode help smoke failed" }
-            Invoke-InstallerAction install
+
+            $supersededDirectory = Join-Path $installRoot 'versions\0.0.0'
+            New-Item -ItemType Directory -Path $supersededDirectory | Out-Null
+            [IO.File]::WriteAllBytes((Join-Path $supersededDirectory 'yucode.exe'), [byte[]]@(0))
+            $supersededManifest = [ordered]@{ name = '@yusys-ai/yucode'; version = '0.0.0' }
+            [IO.File]::WriteAllText(
+              (Join-Path $supersededDirectory 'package.json'),
+              (($supersededManifest | ConvertTo-Json) + "`n"),
+              [Text.UTF8Encoding]::new($false)
+            )
+            Invoke-InstallerAction -InstallerArguments @('--version', $env:RELEASE_VERSION, '--no-modify-path')
+            if (Test-Path -LiteralPath $supersededDirectory) { throw "Superseded version remains after reinstall" }
 
             $keptData = Join-Path $env:HOME '.yucode\agent\keep'
             New-Item -ItemType Directory -Force -Path (Split-Path $keptData) | Out-Null
             [IO.File]::WriteAllText($keptData, "keep`n", [Text.UTF8Encoding]::new($false))
-            Invoke-InstallerAction uninstall
+            Invoke-InstallerAction -InstallerArguments @('--uninstall')
             if (Test-Path -LiteralPath $installRoot) { throw "Install root remains after uninstall" }
             if ([IO.File]::ReadAllText($keptData).Trim() -ne 'keep') { throw "User data was removed" }
 
@@ -1012,7 +1332,7 @@ jobs:
             New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
             $fakeManifest = [ordered]@{
               name = '@yusys-ai/yucode'
-              version = '0.0.0-smoke'
+              version = '0.0.0'
               bin = [ordered]@{ yucode = 'bin/yucode.js' }
             }
             [IO.File]::WriteAllText(
@@ -1027,7 +1347,7 @@ jobs:
             )
             & npm pack $fakePackage --pack-destination $smokeRoot --ignore-scripts | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Unable to pack npm migration fixture" }
-            $fakeTgz = Join-Path $smokeRoot 'yusys-ai-yucode-0.0.0-smoke.tgz'
+            $fakeTgz = Join-Path $smokeRoot 'yusys-ai-yucode-0.0.0.tgz'
             if (-not (Test-Path -LiteralPath $fakeTgz -PathType Leaf)) { throw "npm migration fixture is missing" }
             & npm install -g $fakeTgz --ignore-scripts
             if ($LASTEXITCODE -ne 0) { throw "Unable to install npm migration fixture" }
@@ -1038,7 +1358,7 @@ jobs:
               throw "npm migration fixture was not installed"
             }
 
-            Invoke-InstallerAction install
+            Invoke-InstallerAction -InstallerArguments @('--version', $env:RELEASE_VERSION, '--no-modify-path')
             if (Test-Path -LiteralPath $npmPackage) { throw "npm package remains after migration" }
             if (-not (Test-Path -LiteralPath $wrapper -PathType Leaf)) { throw "Native wrapper is missing after migration" }
             $reportedVersion = (& $wrapper --version | Out-String).Trim()
@@ -1048,9 +1368,9 @@ jobs:
             & $wrapper --help | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Migrated yucode help smoke failed" }
 
-            Invoke-InstallerAction uninstall
+            Invoke-InstallerAction -InstallerArguments @('--uninstall', '--purge')
             if (Test-Path -LiteralPath $installRoot) { throw "Install root remains after final uninstall" }
-            if ([IO.File]::ReadAllText($keptData).Trim() -ne 'keep') { throw "User data was removed" }
+            if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.yucode')) { throw "User data remains after purge" }
           } finally {
             Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
           }
