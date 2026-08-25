@@ -16,7 +16,7 @@ function Fail {
 
 function Test-Version {
 	param([string]$Version)
-	return ($Version -match $script:VersionPattern)
+	return ($Version -cmatch $script:VersionPattern)
 }
 
 function Compare-Decimal {
@@ -86,6 +86,7 @@ function Invoke-Download {
 function Write-AtomicText {
 	param([string]$Path, [string]$Content)
 	$temporary = "$Path.tmp.$([Guid]::NewGuid().ToString('N'))"
+	$backup = $null
 	try {
 		[IO.File]::WriteAllText($temporary, $Content, [Text.UTF8Encoding]::new($false))
 		$item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
@@ -93,12 +94,15 @@ function Write-AtomicText {
 			if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
 				Fail "Managed state path is not a regular file: $Path"
 			}
-			[IO.File]::Replace($temporary, $Path, $null, $true)
+			$backup = "$Path.backup.$([Guid]::NewGuid().ToString('N'))"
+			[IO.File]::Replace($temporary, $Path, $backup, $true)
+			[IO.File]::Delete($backup)
 		} else {
 			[IO.File]::Move($temporary, $Path)
 		}
 	} finally {
 		if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+		if ($null -ne $backup -and [IO.File]::Exists($backup)) { [IO.File]::Delete($backup) }
 	}
 }
 
@@ -279,6 +283,7 @@ function Ensure-UserPath {
 	$userPath = [Environment]::GetEnvironmentVariable('Path', [EnvironmentVariableTarget]::User)
 	$entries = @(Get-UserPathEntries $userPath)
 	$present = Test-PathEntry $entries $BinDirectory
+	if ($NoModify) { return $PreviouslyAdded -and $present }
 	if ($PreviouslyAdded) {
 		if (-not $present) {
 			$entries += $BinDirectory
@@ -344,13 +349,23 @@ function Assert-ManagedPath {
 }
 
 function Get-GlobalNpmInstallation {
-	$npmCommand = Get-Command npm -All -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -in @('Application', 'ExternalScript') } | Select-Object -First 1
+	$npmCommand = Get-Command npm.cmd -All -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+	if ($null -eq $npmCommand) {
+		$npmCommand = Get-Command npm -All -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+	}
+	if ($null -eq $npmCommand) {
+		$npmCommand = Get-Command npm -All -CommandType ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+	}
 	if ($null -eq $npmCommand) { return [pscustomobject]@{ Status = 'absent' } }
 	$npmPath = if ([String]::IsNullOrWhiteSpace($npmCommand.Path)) { $npmCommand.Source } else { $npmCommand.Path }
-	$rootOutput = @(& $npmPath root -g 2>$null)
-	$rootExitCode = $LASTEXITCODE
-	$prefixOutput = @(& $npmPath prefix -g 2>$null)
-	$prefixExitCode = $LASTEXITCODE
+	try {
+		$rootOutput = @(& $npmPath root -g 2>$null)
+		$rootExitCode = $LASTEXITCODE
+		$prefixOutput = @(& $npmPath prefix -g 2>$null)
+		$prefixExitCode = $LASTEXITCODE
+	} catch {
+		return [pscustomobject]@{ Status = 'unsafe'; Reason = 'Unable to execute the active global npm installation' }
+	}
 	if ($rootExitCode -ne 0 -or $prefixExitCode -ne 0 -or $rootOutput.Count -ne 1 -or $prefixOutput.Count -ne 1) {
 		return [pscustomobject]@{ Status = 'unsafe'; Reason = 'Unable to resolve the active global npm installation' }
 	}
@@ -379,12 +394,17 @@ function Get-GlobalNpmInstallation {
 	if ([string]$manifest.name -ne '@yusys-ai/yucode') {
 		return [pscustomobject]@{ Status = 'unsafe'; Reason = "The global npm package manifest is not @yusys-ai/yucode: $manifestPath" }
 	}
+	$version = [string]$manifest.version
+	if (-not (Test-Version $version)) {
+		return [pscustomobject]@{ Status = 'unsafe'; Reason = "The global npm package manifest has an invalid version: $manifestPath" }
+	}
 	return [pscustomobject]@{
 		Status = 'verified'
 		NpmPath = $npmPath
 		Prefix = $prefix
 		Root = $root
 		PackageDirectory = $packageDirectory
+		Version = $version
 	}
 }
 
@@ -543,8 +563,94 @@ function Get-Platform {
 	}
 }
 
+function Assert-ManagedVersionDirectory {
+	param([string]$Path, [string]$Version)
+	if (-not (Test-Version $Version)) { Fail "Managed version directory has an invalid name: $Path" }
+	$item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+	if ($null -eq $item -or -not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+		Fail "Managed version path is not a regular directory: $Path"
+	}
+	$binaryPath = Join-Path $Path 'yucode.exe'
+	$manifestPath = Join-Path $Path 'package.json'
+	foreach ($requiredPath in @($binaryPath, $manifestPath)) {
+		$requiredItem = Get-Item -LiteralPath $requiredPath -Force -ErrorAction SilentlyContinue
+		if ($null -eq $requiredItem -or $requiredItem.PSIsContainer -or ($requiredItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+			Fail "Managed version directory is incomplete: $Path"
+		}
+	}
+	try {
+		$manifest = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+	} catch {
+		Fail "Managed version manifest is invalid: $manifestPath"
+	}
+	if ([string]$manifest.name -ne '@yusys-ai/yucode' -or [string]$manifest.version -cne $Version) {
+		Fail "Managed version manifest does not match $Version"
+	}
+}
+
+function Assert-PartialManagedInstallation {
+	param(
+		[string]$InstallRoot,
+		[string]$StatePath,
+		[string]$VersionsDirectory,
+		[string]$BinDirectory,
+		[string]$Wrapper
+	)
+	foreach ($entry in (Get-ChildItem -LiteralPath $InstallRoot -Force)) {
+		if (@('state', 'versions', 'bin') -notcontains $entry.Name -or -not $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+			Fail "Refusing to remove an incomplete installation containing an unmanaged path: $($entry.FullName)"
+		}
+	}
+	$stateDirectory = Split-Path -Parent $StatePath
+	foreach ($entry in (Get-ChildItem -LiteralPath $stateDirectory -Force)) {
+		if ($entry.Name -cne 'managed' -or $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+			Fail "Refusing to remove an incomplete installation containing unmanaged state: $($entry.FullName)"
+		}
+	}
+	if (Test-Path -LiteralPath $BinDirectory -PathType Container) {
+		foreach ($entry in (Get-ChildItem -LiteralPath $BinDirectory -Force)) {
+			if (-not [StringComparer]::OrdinalIgnoreCase.Equals($entry.FullName, $Wrapper) -or $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+				Fail "Refusing to remove an incomplete installation containing an unmanaged command: $($entry.FullName)"
+			}
+		}
+	}
+	if (Test-Path -LiteralPath $VersionsDirectory -PathType Container) {
+		foreach ($entry in (Get-ChildItem -LiteralPath $VersionsDirectory -Force)) {
+			Assert-ManagedVersionDirectory $entry.FullName $entry.Name
+		}
+	}
+}
+
+function Remove-OldManagedVersions {
+	param(
+		[string]$VersionsDirectory,
+		[string]$CurrentVersion,
+		[string]$LocalAppDataRoot
+	)
+	if (Get-Process -Name 'yucode' -ErrorAction SilentlyContinue) { return }
+	Assert-ManagedPath $VersionsDirectory $LocalAppDataRoot $false
+	$oldDirectories = [System.Collections.Generic.List[string]]::new()
+	foreach ($entry in (Get-ChildItem -LiteralPath $VersionsDirectory -Force)) {
+		Assert-ManagedVersionDirectory $entry.FullName $entry.Name
+		if ($entry.Name -cne $CurrentVersion) { $oldDirectories.Add($entry.FullName) }
+	}
+	foreach ($directory in $oldDirectories) {
+		Assert-ManagedPath $directory $LocalAppDataRoot $false
+		Remove-SafeTree $directory
+	}
+}
+
 function Uninstall-Yucode {
-	param([string]$LocalAppDataRoot, [string]$InstallRoot, [string]$Wrapper, [string]$StatePath, [string]$BinDirectory)
+	param(
+		[string]$LocalAppDataRoot,
+		[string]$InstallRoot,
+		[string]$VersionsDirectory,
+		[string]$Wrapper,
+		[string]$StatePath,
+		[string]$BinDirectory,
+		[string]$UserDataDirectory,
+		[bool]$Purge
+	)
 	foreach ($path in @($InstallRoot, $StatePath, $BinDirectory, $Wrapper)) {
 		Assert-ManagedPath $path $LocalAppDataRoot $true
 	}
@@ -557,7 +663,6 @@ function Uninstall-Yucode {
 		foreach ($path in @($InstallRoot, $StatePath, $BinDirectory, $Wrapper)) {
 			Assert-ManagedPath $path $LocalAppDataRoot $true
 		}
-		if ($null -eq $state) { Fail "Managed installation state is incomplete" }
 		$item = Get-Item -LiteralPath $InstallRoot -Force
 		if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
 			Fail "Refusing to remove an unmanaged path: $InstallRoot"
@@ -567,15 +672,24 @@ function Uninstall-Yucode {
 		if ($null -eq $markerItem -or $markerItem.PSIsContainer -or ($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [IO.File]::ReadAllText($marker).Trim() -ne '1') {
 			Fail "Refusing to remove an unmanaged directory: $InstallRoot"
 		}
+		if ($null -eq $state) {
+			Assert-PartialManagedInstallation $InstallRoot $StatePath $VersionsDirectory $BinDirectory $Wrapper
+		}
 		if (Get-Process -Name 'yucode' -ErrorAction SilentlyContinue) { Fail "Close all running yucode processes before uninstalling" }
 		Assert-ManagedPath $InstallRoot $LocalAppDataRoot $false
-		Assert-ManagedPath $StatePath $LocalAppDataRoot $false
+		Assert-ManagedPath $StatePath $LocalAppDataRoot ($null -eq $state)
 		Assert-ManagedPath $BinDirectory $LocalAppDataRoot $true
 		Assert-ManagedPath $Wrapper $LocalAppDataRoot $true
 		Remove-SafeTree $InstallRoot
 	}
 	if ($null -ne $state -and [bool]$state.pathAdded) { Remove-UserPath $BinDirectory }
-	Write-Output "$script:Product was uninstalled. User data under $HOME\.yucode was kept."
+	if ($Purge) {
+		if (Get-Process -Name 'yucode' -ErrorAction SilentlyContinue) { Fail "Close all running yucode processes before purging user data" }
+		Remove-SafeTree $UserDataDirectory
+		Write-Output "$script:Product was uninstalled. User data under $UserDataDirectory was removed."
+	} else {
+		Write-Output "$script:Product was uninstalled. User data under $UserDataDirectory was kept."
+	}
 }
 
 function Install-Yucode {
@@ -586,7 +700,10 @@ function Install-Yucode {
 		[string]$StateDirectory,
 		[string]$StatePath,
 		[string]$BinDirectory,
-		[string]$Wrapper
+		[string]$Wrapper,
+		[string]$Channel,
+		[string]$VersionOverride,
+		[bool]$NoModifyPath
 	)
 	foreach ($path in @($InstallRoot, $VersionsDirectory, $StateDirectory, $StatePath, $BinDirectory, $Wrapper)) {
 		Assert-ManagedPath $path $LocalAppDataRoot $true
@@ -619,21 +736,24 @@ function Install-Yucode {
 	$markerPath = Join-Path $StateDirectory 'managed'
 	Assert-ManagedPath $markerPath $LocalAppDataRoot $true
 	Write-AtomicText $markerPath "1`n"
-	$channel = $env:YUCODE_CHANNEL
-	if ([String]::IsNullOrEmpty($channel)) {
-		$channel = if ($null -eq $existingState) { 'default' } else { [string]$existingState.channel }
-	}
-	if (@('default', 'stable', 'rc') -notcontains $channel) { Fail "Invalid channel: $channel" }
+	if (@('default', 'rc') -notcontains $Channel) { Fail "Invalid release selection: $Channel" }
 	$stagingDirectory = Join-Path $InstallRoot ".staging.$([Guid]::NewGuid().ToString('N'))"
 	Assert-ManagedPath $stagingDirectory $LocalAppDataRoot $true
 	New-Item -ItemType Directory -Path $stagingDirectory | Out-Null
 	Assert-ManagedPath $stagingDirectory $LocalAppDataRoot $false
 	try {
-		$version = $env:YUCODE_VERSION
-		if ([String]::IsNullOrEmpty($version)) { $version = Get-ChannelVersion $channel $stagingDirectory }
+		if (-not [String]::IsNullOrEmpty($VersionOverride)) {
+			$version = $VersionOverride
+		} else {
+			$version = Get-ChannelVersion $Channel $stagingDirectory
+		}
 		if (-not (Test-Version $version)) { Fail "Invalid release version: $version" }
-		if ($null -ne $existingState -and (Compare-Version $version ([string]$existingState.version)) -lt 0 -and $env:YUCODE_ALLOW_DOWNGRADE -ne '1') {
-			Fail "Refusing to downgrade from $($existingState.version) to $version; set YUCODE_ALLOW_DOWNGRADE=1 to override"
+		if ($null -ne $existingState -and (Compare-Version $version ([string]$existingState.version)) -lt 0) {
+			Fail "Refusing to downgrade from $($existingState.version) to $version; downgrades are not supported"
+		}
+		$npmInstallation = Get-GlobalNpmInstallation
+		if ($npmInstallation.Status -eq 'verified' -and (Compare-Version $version ([string]$npmInstallation.Version)) -lt 0) {
+			Fail "Refusing to downgrade from $($npmInstallation.Version) to $version; downgrades are not supported"
 		}
 		$versionDirectory = Join-Path $VersionsDirectory $version
 		Assert-ManagedPath $versionDirectory $LocalAppDataRoot $true
@@ -657,8 +777,8 @@ function Install-Yucode {
 			$asset = "yucode-$platform.zip"
 			$archivePath = Join-Path $stagingDirectory $asset
 			$checksumPath = Join-Path $stagingDirectory 'SHA256SUMS'
-			Invoke-Download "$script:ReleaseBase/v$version/$asset" $archivePath
-			Invoke-Download "$script:ReleaseBase/v$version/SHA256SUMS" $checksumPath
+			Invoke-Download "$script:ReleaseBase/v$version/$asset" $archivePath | Out-Null
+			Invoke-Download "$script:ReleaseBase/v$version/SHA256SUMS" $checksumPath | Out-Null
 			$expectedHash = Get-ExpectedChecksum $checksumPath $asset
 			$actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 			if ($actualHash -ne $expectedHash) { Fail "Checksum mismatch for $asset" }
@@ -683,15 +803,26 @@ function Install-Yucode {
 			& $binaryPath --help | Out-Null
 			if ($LASTEXITCODE -ne 0) { Fail "Release binary help smoke failed" }
 			Assert-ManagedPath $versionDirectory $LocalAppDataRoot $true
-			[IO.Directory]::Move($extractionRoot, $versionDirectory)
+			Start-Sleep -Seconds 1
+			for ($moveAttempt = 1; $moveAttempt -le 10; $moveAttempt++) {
+				try {
+					[IO.Directory]::Move($extractionRoot, $versionDirectory)
+					break
+				} catch [IO.IOException] {
+					if ($moveAttempt -eq 10 -or -not (Test-Path -LiteralPath $extractionRoot -PathType Container) -or (Test-Path -LiteralPath $versionDirectory)) {
+						throw
+					}
+					Start-Sleep -Milliseconds 200
+				}
+			}
 			Assert-ManagedPath $versionDirectory $LocalAppDataRoot $false
 		}
 		$previouslyAdded = $null -ne $existingState -and [bool]$existingState.pathAdded
-		$pathAdded = Ensure-UserPath $BinDirectory $previouslyAdded ($env:YUCODE_NO_MODIFY_PATH -eq '1')
+		$pathAdded = Ensure-UserPath $BinDirectory $previouslyAdded $NoModifyPath
 		$state = [ordered]@{
 			schemaVersion = 1
 			version = $version
-			channel = $channel
+			channel = $Channel
 			pathAdded = $pathAdded
 		}
 		Assert-ManagedPath $StatePath $LocalAppDataRoot $true
@@ -712,11 +843,41 @@ $tls12 = [Net.SecurityProtocolType]::Tls12
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 
-$action = $env:YUCODE_ACTION
-if ([String]::IsNullOrEmpty($action)) { $action = 'install' }
-if (@('install', 'uninstall') -notcontains $action) { Fail "Invalid action: $action" }
-if (@('', '0', '1') -notcontains [string]$env:YUCODE_NO_MODIFY_PATH) { Fail "YUCODE_NO_MODIFY_PATH must be 0 or 1" }
-if (@('', '0', '1') -notcontains [string]$env:YUCODE_ALLOW_DOWNGRADE) { Fail "YUCODE_ALLOW_DOWNGRADE must be 0 or 1" }
+$action = 'install'
+$channel = 'default'
+$versionOverride = $null
+$noModifyPath = $false
+$purge = $false
+$selection = 'default'
+for ($argumentIndex = 0; $argumentIndex -lt $args.Count; $argumentIndex++) {
+	$argument = [string]$args[$argumentIndex]
+	switch ($argument) {
+		'--preview' {
+			if ($selection -ne 'default') { Fail '--preview cannot be combined with another release selection' }
+			$selection = 'preview'
+			$channel = 'rc'
+		}
+		'--version' {
+			if ($selection -ne 'default') { Fail '--version cannot be combined with another release selection' }
+			if ($argumentIndex + 1 -ge $args.Count) { Fail '--version requires a value' }
+			$argumentIndex++
+			$versionOverride = [string]$args[$argumentIndex]
+			if ($versionOverride.StartsWith('--', [StringComparison]::Ordinal)) { Fail '--version requires a value' }
+			$selection = 'exact'
+		}
+		'--uninstall' { $action = 'uninstall' }
+		'--purge' { $purge = $true }
+		'--no-modify-path' { $noModifyPath = $true }
+		default { Fail "Unknown argument: $argument" }
+	}
+}
+if ($selection -eq 'exact' -and -not (Test-Version $versionOverride)) { Fail "Invalid release version: $versionOverride" }
+if ($action -eq 'uninstall') {
+	if ($selection -ne 'default') { Fail '--uninstall cannot be combined with --preview or --version' }
+	if ($noModifyPath) { Fail '--no-modify-path is only valid when installing' }
+} elseif ($purge) {
+	Fail '--purge requires --uninstall'
+}
 if ([String]::IsNullOrEmpty($env:LOCALAPPDATA)) { Fail "LOCALAPPDATA is not set" }
 
 try {
@@ -726,6 +887,35 @@ try {
 }
 if ([String]::IsNullOrWhiteSpace($localAppDataRoot) -or -not (Test-PathWithinWithoutReparse $localAppDataRoot $localAppDataRoot)) {
 	Fail "LOCALAPPDATA must be a regular local directory"
+}
+$userDataDirectory = Join-Path $HOME '.yucode'
+if ($purge) {
+	$userProfileValue = $env:USERPROFILE
+	if ([String]::IsNullOrWhiteSpace($userProfileValue)) {
+		$userProfileValue = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+	}
+	if ([String]::IsNullOrWhiteSpace($userProfileValue)) {
+		Fail "Unable to resolve an absolute user profile for purge"
+	}
+	$isDriveAbsolute = $userProfileValue -match '^[A-Za-z]:[\\/]'
+	$isUncAbsolute = $userProfileValue -match '^[\\/]{2}[^\\/]+[\\/][^\\/]+'
+	if (-not $isDriveAbsolute -and -not $isUncAbsolute) {
+		Fail "Unable to resolve an absolute user profile for purge"
+	}
+	try {
+		$fullUserProfile = [IO.Path]::GetFullPath($userProfileValue)
+		$volumeRoot = [IO.Path]::GetPathRoot($fullUserProfile)
+	} catch {
+		Fail "USERPROFILE is invalid"
+	}
+	if ([String]::IsNullOrWhiteSpace($volumeRoot) -or [StringComparer]::OrdinalIgnoreCase.Equals($fullUserProfile.TrimEnd('\'), $volumeRoot.TrimEnd('\'))) {
+		Fail "Refusing to purge user data from a volume root"
+	}
+	$userProfileRoot = $fullUserProfile.TrimEnd('\')
+	$userDataDirectory = Join-Path $userProfileRoot '.yucode'
+	if (-not (Test-PathWithinWithoutReparse -Path $userDataDirectory -Root $userProfileRoot -AllowMissing $true)) {
+		Fail "User data path escapes USERPROFILE or passes through a reparse point: $userDataDirectory"
+	}
 }
 $installRoot = Join-Path $localAppDataRoot 'Yusys\CodeMate'
 $versionsDirectory = Join-Path $installRoot 'versions'
@@ -748,12 +938,14 @@ try {
 	}
 	if (-not $lockAcquired) { Fail "Another yucode installer is active" }
 	if ($action -eq 'uninstall') {
-		Uninstall-Yucode $localAppDataRoot $installRoot $wrapper $statePath $binDirectory
+		Uninstall-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -Wrapper $wrapper -StatePath $statePath -BinDirectory $binDirectory -UserDataDirectory $userDataDirectory -Purge $purge
 	} else {
-		Install-Yucode $localAppDataRoot $installRoot $versionsDirectory $stateDirectory $statePath $binDirectory $wrapper
+		Install-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -StateDirectory $stateDirectory -StatePath $statePath -BinDirectory $binDirectory -Wrapper $wrapper -Channel $channel -VersionOverride $versionOverride -NoModifyPath $noModifyPath
 		Invoke-InstallNpmMigration $localAppDataRoot $installRoot $statePath $versionsDirectory $binDirectory $wrapper
 		Assert-ManagedPath $StatePath $localAppDataRoot $false
 		$installedState = Read-State $statePath
+		Test-NativeInstallation $statePath $versionsDirectory $wrapper | Out-Null
+		Remove-OldManagedVersions $versionsDirectory ([string]$installedState.version) $localAppDataRoot
 		Write-Output "$Product $($installedState.version) is installed. Open a new terminal, then run: yucode"
 		foreach ($path in @(Get-YucodeShadowCommands $wrapper)) {
 			Write-Warning "The current session resolves yucode to $path instead of $wrapper."

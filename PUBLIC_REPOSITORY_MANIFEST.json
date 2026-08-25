@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
-	"version": "0.842.0-rc1",
-	"sourceCommit": "3157fa0af4c7375a70bba6fd4cca953ae0f5df70",
+	"version": "0.842.0-rc3",
+	"sourceCommit": "6d10f279281e2a53b8aaa103970e63102e0a5931",
 	"files": [
 		{
 			"path": ".github/workflows/publish.yml",
@@ -55,8 +55,8 @@
 		},
 		{
 			"path": "README.md",
-			"size": 3336,
-			"sha256": "fcc90f899166d1f6e72151dcd5a02c7a8c5a466d8b5381840bfc0e63c7116da1"
+			"size": 4361,
+			"sha256": "32ee7cf43a27e2ee47a57dfa5519866918d9578e3a5c4a9a8de3b835729f3458"
 		},
 		{
 			"path": "THIRD_PARTY_NOTICES.md",
@@ -66,22 +66,22 @@
 		{
 			"path": "channels/default",
 			"size": 12,
-			"sha256": "c973b396aa125ac3ae37c2d3e36f3a36028bd45ce82850d9215b2fd8ef507cce"
+			"sha256": "34b6590bdce30790480299db83a8a51ca9c1b549613cf9f228455bc08496ccd3"
 		},
 		{
 			"path": "channels/rc",
 			"size": 12,
-			"sha256": "c973b396aa125ac3ae37c2d3e36f3a36028bd45ce82850d9215b2fd8ef507cce"
+			"sha256": "34b6590bdce30790480299db83a8a51ca9c1b549613cf9f228455bc08496ccd3"
 		},
 		{
 			"path": "install.ps1",
-			"size": 35981,
-			"sha256": "818c946f8ef4624be9e05f22e37efd0a97f24a9d36218a8fe091fa08757104fc"
+			"size": 44356,
+			"sha256": "481213da959f992ab985cd03ad7dc4c7481d3320ca713a89e925b628df83b3bf"
 		},
 		{
 			"path": "install.sh",
-			"size": 30637,
-			"sha256": "d12c882853c7501d7c096fbd523d29ac0a210754e343edcfebe04e15599e2fa7"
+			"size": 35598,
+			"sha256": "f3d07857962ad4d5829865bc44b67e97819155edf0e13ecf53a61957532c97ce"
 		}
 	]
 }
