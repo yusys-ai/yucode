@@ -39,7 +39,8 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # Draft Releases are only visible to tokens with push access.
+      contents: write
     outputs:
       checksums_sha256: ${{ steps.release.outputs.checksums_sha256 }}
       kind: ${{ steps.release.outputs.kind }}
@@ -410,7 +411,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
-      contents: read
+      # Draft Releases are only visible to tokens with push access.
+      contents: write
       id-token: write
     steps:
       - name: Checkout release metadata
@@ -829,7 +831,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
-      contents: read
+      # Draft Releases are only visible to tokens with push access.
+      contents: write
       id-token: write
     steps:
       - name: Checkout release metadata
