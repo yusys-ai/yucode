@@ -703,6 +703,7 @@ function Install-Yucode {
 		[string]$Wrapper,
 		[string]$Channel,
 		[string]$VersionOverride,
+		[string]$ReleaseAssets,
 		[bool]$NoModifyPath
 	)
 	foreach ($path in @($InstallRoot, $VersionsDirectory, $StateDirectory, $StatePath, $BinDirectory, $Wrapper)) {
@@ -777,8 +778,21 @@ function Install-Yucode {
 			$asset = "yucode-$platform.zip"
 			$archivePath = Join-Path $stagingDirectory $asset
 			$checksumPath = Join-Path $stagingDirectory 'SHA256SUMS'
-			Invoke-Download "$script:ReleaseBase/v$version/$asset" $archivePath | Out-Null
-			Invoke-Download "$script:ReleaseBase/v$version/SHA256SUMS" $checksumPath | Out-Null
+			if (-not [String]::IsNullOrEmpty($ReleaseAssets)) {
+				$archiveSource = Join-Path $ReleaseAssets $asset
+				$checksumSource = Join-Path $ReleaseAssets 'SHA256SUMS'
+				foreach ($source in @($archiveSource, $checksumSource)) {
+					$item = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+					if ($null -eq $item -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+						Fail "Release asset is not a regular file: $source"
+					}
+				}
+				[IO.File]::Copy($archiveSource, $archivePath)
+				[IO.File]::Copy($checksumSource, $checksumPath)
+			} else {
+				Invoke-Download "$script:ReleaseBase/v$version/$asset" $archivePath | Out-Null
+				Invoke-Download "$script:ReleaseBase/v$version/SHA256SUMS" $checksumPath | Out-Null
+			}
 			$expectedHash = Get-ExpectedChecksum $checksumPath $asset
 			$actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 			if ($actualHash -ne $expectedHash) { Fail "Checksum mismatch for $asset" }
@@ -846,6 +860,7 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $action = 'install'
 $channel = 'default'
 $versionOverride = $null
+$releaseAssets = $null
 $noModifyPath = $false
 $purge = $false
 $selection = 'default'
@@ -865,6 +880,13 @@ for ($argumentIndex = 0; $argumentIndex -lt $args.Count; $argumentIndex++) {
 			if ($versionOverride.StartsWith('--', [StringComparison]::Ordinal)) { Fail '--version requires a value' }
 			$selection = 'exact'
 		}
+		'--release-assets' {
+			if ($null -ne $releaseAssets) { Fail '--release-assets may only be specified once' }
+			if ($argumentIndex + 1 -ge $args.Count) { Fail '--release-assets requires a value' }
+			$argumentIndex++
+			$releaseAssets = [string]$args[$argumentIndex]
+			if ($releaseAssets.StartsWith('--', [StringComparison]::Ordinal)) { Fail '--release-assets requires a value' }
+		}
 		'--uninstall' { $action = 'uninstall' }
 		'--purge' { $purge = $true }
 		'--no-modify-path' { $noModifyPath = $true }
@@ -872,6 +894,16 @@ for ($argumentIndex = 0; $argumentIndex -lt $args.Count; $argumentIndex++) {
 	}
 }
 if ($selection -eq 'exact' -and -not (Test-Version $versionOverride)) { Fail "Invalid release version: $versionOverride" }
+if ($null -ne $releaseAssets) {
+	if ($action -ne 'install') { Fail '--release-assets is only valid when installing' }
+	if ($selection -ne 'exact') { Fail '--release-assets requires --version' }
+	if (-not [IO.Path]::IsPathRooted($releaseAssets)) { Fail '--release-assets requires an absolute directory' }
+	$item = Get-Item -LiteralPath $releaseAssets -Force -ErrorAction SilentlyContinue
+	if ($null -eq $item -or -not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+		Fail "--release-assets is not a regular directory: $releaseAssets"
+	}
+	$releaseAssets = $item.FullName
+}
 if ($action -eq 'uninstall') {
 	if ($selection -ne 'default') { Fail '--uninstall cannot be combined with --preview or --version' }
 	if ($noModifyPath) { Fail '--no-modify-path is only valid when installing' }
@@ -940,7 +972,7 @@ try {
 	if ($action -eq 'uninstall') {
 		Uninstall-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -Wrapper $wrapper -StatePath $statePath -BinDirectory $binDirectory -UserDataDirectory $userDataDirectory -Purge $purge
 	} else {
-		Install-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -StateDirectory $stateDirectory -StatePath $statePath -BinDirectory $binDirectory -Wrapper $wrapper -Channel $channel -VersionOverride $versionOverride -NoModifyPath $noModifyPath
+		Install-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -StateDirectory $stateDirectory -StatePath $statePath -BinDirectory $binDirectory -Wrapper $wrapper -Channel $channel -VersionOverride $versionOverride -ReleaseAssets $releaseAssets -NoModifyPath $noModifyPath
 		Invoke-InstallNpmMigration $localAppDataRoot $installRoot $statePath $versionsDirectory $binDirectory $wrapper
 		Assert-ManagedPath $StatePath $localAppDataRoot $false
 		$installedState = Read-State $statePath

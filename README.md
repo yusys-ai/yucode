@@ -73,15 +73,15 @@ curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | s
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1))) '--preview'
 ```
 
-Use `--version <version>` to install any exact public stable or release-candidate
+Replace `VERSION` below with any exact public stable or release-candidate
 version that is not older than the installed version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | sh -s -- --version 0.842.0-rc1
+curl -fsSL https://raw.githubusercontent.com/yusys-ai/yucode/main/install.sh | sh -s -- --version VERSION
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1))) '--version' '0.842.0-rc1'
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/yusys-ai/yucode/main/install.ps1))) '--version' 'VERSION'
 ```
 
 Each run selects from its current arguments; an earlier preview installation

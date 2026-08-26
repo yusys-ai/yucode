@@ -807,8 +807,17 @@ install() {
 		asset="yucode-${PLATFORM}.tar.gz"
 		archive="$STAGING_DIRECTORY/$asset"
 		checksums="$STAGING_DIRECTORY/SHA256SUMS"
-		download "$RELEASE_BASE/v$VERSION/$asset" "$archive"
-		download "$RELEASE_BASE/v$VERSION/SHA256SUMS" "$checksums"
+		if [ "$RELEASE_ASSETS_SET" = "1" ]; then
+			asset_source="$RELEASE_ASSETS/$asset"
+			checksums_source="$RELEASE_ASSETS/SHA256SUMS"
+			[ -f "$asset_source" ] && [ ! -L "$asset_source" ] || fail "Release asset is not a regular file: $asset_source"
+			[ -f "$checksums_source" ] && [ ! -L "$checksums_source" ] || fail "Release checksums are not a regular file: $checksums_source"
+			cp "$asset_source" "$archive"
+			cp "$checksums_source" "$checksums"
+		else
+			download "$RELEASE_BASE/v$VERSION/$asset" "$archive"
+			download "$RELEASE_BASE/v$VERSION/SHA256SUMS" "$checksums"
+		fi
 		verify_checksum "$checksums" "$asset" "$archive"
 		validate_tar_archive "$archive" "$STAGING_DIRECTORY/archive.list" "$STAGING_DIRECTORY/archive.types"
 		extract_directory="$STAGING_DIRECTORY/extract"
@@ -855,6 +864,8 @@ if printf '%s' "$HOME" | LC_ALL=C grep -q '[[:cntrl:]]'; then fail "HOME contain
 ACTION=install
 CHANNEL=default
 VERSION_OVERRIDE=
+RELEASE_ASSETS=
+RELEASE_ASSETS_SET=0
 NO_MODIFY_PATH=0
 PURGE=0
 SELECTION=default
@@ -873,6 +884,15 @@ while [ "$#" -gt 0 ]; do
 			VERSION_OVERRIDE="$2"
 			shift
 			;;
+		--release-assets)
+			[ "$RELEASE_ASSETS_SET" = "0" ] || fail "--release-assets may only be specified once"
+			[ "$#" -ge 2 ] || fail "--release-assets requires a value"
+			[ -n "$2" ] || fail "--release-assets requires a value"
+			case "$2" in --*) fail "--release-assets requires a value" ;; esac
+			RELEASE_ASSETS="$2"
+			RELEASE_ASSETS_SET=1
+			shift
+			;;
 		--uninstall) ACTION=uninstall ;;
 		--purge) PURGE=1 ;;
 		--no-modify-path) NO_MODIFY_PATH=1 ;;
@@ -882,6 +902,12 @@ while [ "$#" -gt 0 ]; do
 done
 if [ "$SELECTION" = "exact" ]; then
 	validate_version "$VERSION_OVERRIDE" || fail "Invalid release version: $VERSION_OVERRIDE"
+fi
+if [ "$RELEASE_ASSETS_SET" = "1" ]; then
+	[ "$ACTION" = "install" ] || fail "--release-assets is only valid when installing"
+	[ "$SELECTION" = "exact" ] || fail "--release-assets requires --version"
+	case "$RELEASE_ASSETS" in /*) ;; *) fail "--release-assets requires an absolute directory" ;; esac
+	[ -d "$RELEASE_ASSETS" ] && [ ! -L "$RELEASE_ASSETS" ] || fail "--release-assets is not a regular directory: $RELEASE_ASSETS"
 fi
 if [ "$ACTION" = "uninstall" ]; then
 	[ "$SELECTION" = "default" ] || fail "--uninstall cannot be combined with --preview or --version"
@@ -918,7 +944,7 @@ acquire_lock
 if [ "$ACTION" = "uninstall" ]; then
 	uninstall
 else
-	require_command curl
+	if [ "$RELEASE_ASSETS_SET" = "1" ]; then require_command cp; else require_command curl; fi
 	require_command find
 	require_command tar
 	install
