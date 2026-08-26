@@ -1120,260 +1120,93 @@ jobs:
           fi
           test "$(jq -r '.published_at | type' "${verification}/published-release.json")" = string
 
-  smoke-unix:
+  verify-release-delivery:
     if: >-
       always() &&
       !cancelled() &&
       needs.preflight.result == 'success' &&
       needs.publish-release.result == 'success'
     needs: [preflight, publish-release]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            kernel: Darwin
-            architecture: arm64
-          - runner: macos-15-intel
-            kernel: Darwin
-            architecture: x86_64
-          - runner: ubuntu-24.04
-            kernel: Linux
-            architecture: x86_64
-          - runner: ubuntu-24.04-arm
-            kernel: Linux
-            architecture: aarch64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Checkout installer source
+      - name: Checkout release metadata
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
           persist-credentials: false
 
-      - name: Smoke public installer
+      - name: Verify immutable public delivery
         env:
-          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
-          EXPECTED_KERNEL: ${{ matrix.kernel }}
+          EXPECTED_RELEASE_ID: ${{ needs.preflight.outputs.release_id }}
+          GH_TOKEN: ${{ github.token }}
           PUBLIC_COMMIT: ${{ inputs.public_commit }}
           RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${PUBLIC_COMMIT}"
-          test "$(uname -s)" = "${EXPECTED_KERNEL}"
-          test "$(uname -m)" = "${EXPECTED_ARCHITECTURE}"
-          smoke_root="$(mktemp -d "${RUNNER_TEMP}/yucode-public-installer.XXXXXX")"
-          smoke_home="${smoke_root}/home"
-          downloaded_installer="${smoke_root}/install.sh"
-          mkdir -p "${smoke_home}"
-          trap 'rm -rf "${smoke_root}"' EXIT
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_TAG}/install.sh" \
-            --output "${downloaded_installer}"
-          cmp install.sh "${downloaded_installer}"
+          verification="$(mktemp -d "${RUNNER_TEMP}/yucode-public-delivery.XXXXXX")"
+          trap 'rm -rf "${verification}"' EXIT
 
-          run_installer() {
-            HOME="${smoke_home}" \
-            PATH="${smoke_home}/.local/bin:${PATH}" \
-            SHELL=/bin/sh \
-            npm_config_prefix="${smoke_home}/.local" \
-              sh "${downloaded_installer}" "$@"
+          download_public() {
+            url="$1"
+            output="$2"
+            for attempt in {1..12}; do
+              rm -f "${output}"
+              if curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+                --fail --silent --show-error --location "${url}" --output "${output}"; then
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
           }
 
-          wrapper="${smoke_home}/.local/bin/yucode"
-          install_root="${smoke_home}/.local/share/yucode"
-          run_installer --version "${RELEASE_VERSION}" --no-modify-path
-          test "$(HOME="${smoke_home}" "${wrapper}" --version)" = "${RELEASE_VERSION}"
-          HOME="${smoke_home}" "${wrapper}" --help >/dev/null
+          release_json="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}")"
+          test "$(jq -r '.id | tostring' <<<"${release_json}")" = "${EXPECTED_RELEASE_ID}"
+          test "$(jq -r .tag_name <<<"${release_json}")" = "${RELEASE_TAG}"
+          test "$(jq -r .draft <<<"${release_json}")" = false
+          test "$(jq -r .immutable <<<"${release_json}")" = true
 
-          superseded_directory="${install_root}/versions/0.0.0"
-          mkdir "${superseded_directory}"
-          run_installer --version "${RELEASE_VERSION}" --no-modify-path
-          test ! -e "${superseded_directory}" && test ! -L "${superseded_directory}"
+          for installer in install.sh install.ps1; do
+            download_public \
+              "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${RELEASE_TAG}/${installer}?run=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              "${verification}/${installer}"
+            cmp "${installer}" "${verification}/${installer}"
+          done
 
-          kept_data="${smoke_home}/.yucode/agent/keep"
-          mkdir -p "$(dirname "${kept_data}")"
-          printf '%s\n' keep > "${kept_data}"
-          run_installer --uninstall
-          test ! -e "${wrapper}" && test ! -L "${wrapper}"
-          test ! -e "${install_root}"
-          test "$(cat "${kept_data}")" = keep
+          mkdir "${verification}/release"
+          download_public \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/SHA256SUMS" \
+            "${verification}/release/SHA256SUMS"
+          awk '
+            $0 !~ /^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 1 }
+            seen[$2]++ { exit 1 }
+            { count++ }
+            END { if (count == 0) exit 1 }
+          ' "${verification}/release/SHA256SUMS"
 
-          fake_package="${smoke_root}/npm-package"
-          mkdir -p "${fake_package}/bin"
-          printf '%s\n' \
-            '{' \
-            '  "name": "@yusys-ai/yucode",' \
-            '  "version": "0.0.0",' \
-            '  "bin": { "yucode": "bin/yucode.js" }' \
-            '}' > "${fake_package}/package.json"
-          printf '%s\n' '#!/usr/bin/env node' 'console.log("npm smoke")' > "${fake_package}/bin/yucode.js"
-          chmod 755 "${fake_package}/bin/yucode.js"
-          HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" \
-            npm pack "${fake_package}" --pack-destination "${smoke_root}" --ignore-scripts >/dev/null
-          fake_tgz="${smoke_root}/yusys-ai-yucode-0.0.0.tgz"
-          test -f "${fake_tgz}"
-          HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" \
-            npm install -g "${fake_tgz}" --ignore-scripts
-          npm_root="$(HOME="${smoke_home}" npm_config_prefix="${smoke_home}/.local" npm root -g)"
-          test -f "${npm_root}/@yusys-ai/yucode/package.json"
-          test -e "${wrapper}" || test -L "${wrapper}"
+          while IFS= read -r filename; do
+            download_public \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${filename}" \
+              "${verification}/release/${filename}"
+          done < <(awk '{print $2}' "${verification}/release/SHA256SUMS")
+          (
+            cd "${verification}/release"
+            sha256sum --check --strict SHA256SUMS
+          )
 
-          run_installer --version "${RELEASE_VERSION}" --no-modify-path
-          test ! -e "${npm_root}/@yusys-ai/yucode" && test ! -L "${npm_root}/@yusys-ai/yucode"
-          test -f "${wrapper}" && test ! -L "${wrapper}"
-          test "$(HOME="${smoke_home}" "${wrapper}" --version)" = "${RELEASE_VERSION}"
-          HOME="${smoke_home}" "${wrapper}" --help >/dev/null
-          run_installer --uninstall --purge
-          test ! -e "${wrapper}" && test ! -L "${wrapper}"
-          test ! -e "${install_root}"
-          test ! -e "${smoke_home}/.yucode" && test ! -L "${smoke_home}/.yucode"
-
-  smoke-windows:
-    if: >-
-      always() &&
-      !cancelled() &&
-      needs.preflight.result == 'success' &&
-      needs.publish-release.result == 'success'
-    needs: [preflight, publish-release]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: windows-2025
-            architecture: AMD64
-          - runner: windows-11-arm
-            architecture: ARM64
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout installer source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag }}
-          persist-credentials: false
-
-      - name: Smoke public installer
-        shell: powershell
-        env:
-          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
-          PUBLIC_COMMIT: ${{ inputs.public_commit }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ((git rev-parse HEAD).Trim() -ne $env:PUBLIC_COMMIT) { throw "Unexpected release commit" }
-          $architecture = $env:PROCESSOR_ARCHITEW6432
-          if ([String]::IsNullOrEmpty($architecture)) { $architecture = $env:PROCESSOR_ARCHITECTURE }
-          if ($architecture.ToUpperInvariant() -ne $env:EXPECTED_ARCHITECTURE) { throw "Unexpected runner architecture: $architecture" }
-
-          $actualUserProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
-          if ([String]::IsNullOrWhiteSpace($actualUserProfile)) { throw "Unable to resolve the runner user profile" }
-          $smokeRoot = Join-Path $actualUserProfile ".yucode-public-installer-$([Guid]::NewGuid().ToString('N'))"
-          $userProfile = Join-Path $smokeRoot 'User'
-          $installer = Join-Path $smokeRoot 'install.ps1'
-          $env:USERPROFILE = $userProfile
-          $env:HOME = $userProfile
-          $env:LOCALAPPDATA = Join-Path $smokeRoot 'Local'
-          $env:APPDATA = Join-Path $smokeRoot 'Roaming'
-          $env:npm_config_prefix = Join-Path $env:APPDATA 'npm'
-          $env:Path = "$($env:npm_config_prefix);$($env:Path)"
-          New-Item -ItemType Directory -Force -Path $userProfile, $env:LOCALAPPDATA, $env:APPDATA | Out-Null
-          try {
-            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:RELEASE_TAG/install.ps1" -OutFile $installer -UseBasicParsing
-            if ((Get-FileHash install.ps1 -Algorithm SHA256).Hash -ne (Get-FileHash $installer -Algorithm SHA256).Hash) {
-              throw "Downloaded installer does not match the release tag"
-            }
-
-            function Invoke-InstallerAction {
-              param([string[]]$InstallerArguments)
-              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer @InstallerArguments
-              if ($LASTEXITCODE -ne 0) { throw "Installer action failed: $($InstallerArguments -join ' ')" }
-            }
-
-            $installRoot = Join-Path $env:LOCALAPPDATA 'Yusys\CodeMate'
-            $wrapper = Join-Path $installRoot 'bin\yucode.cmd'
-            $partialStateDirectory = Join-Path $installRoot 'state'
-            New-Item -ItemType Directory -Force -Path $partialStateDirectory, (Join-Path $installRoot 'versions'), (Join-Path $installRoot 'bin') | Out-Null
-            [IO.File]::WriteAllText((Join-Path $partialStateDirectory 'managed'), "1`n", [Text.UTF8Encoding]::new($false))
-            Invoke-InstallerAction -InstallerArguments @('--uninstall')
-            if (Test-Path -LiteralPath $installRoot) { throw "Partial install root remains after uninstall" }
-
-            Invoke-InstallerAction -InstallerArguments @('--version', $env:RELEASE_VERSION, '--no-modify-path')
-            $reportedVersion = (& $wrapper --version | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne $env:RELEASE_VERSION) {
-              throw "Installed yucode reported an unexpected version"
-            }
-            & $wrapper --help | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Installed yucode help smoke failed" }
-
-            $supersededDirectory = Join-Path $installRoot 'versions\0.0.0'
-            New-Item -ItemType Directory -Path $supersededDirectory | Out-Null
-            [IO.File]::WriteAllBytes((Join-Path $supersededDirectory 'yucode.exe'), [byte[]]@(0))
-            $supersededManifest = [ordered]@{ name = '@yusys-ai/yucode'; version = '0.0.0' }
-            [IO.File]::WriteAllText(
-              (Join-Path $supersededDirectory 'package.json'),
-              (($supersededManifest | ConvertTo-Json) + "`n"),
-              [Text.UTF8Encoding]::new($false)
-            )
-            Invoke-InstallerAction -InstallerArguments @('--version', $env:RELEASE_VERSION, '--no-modify-path')
-            if (Test-Path -LiteralPath $supersededDirectory) { throw "Superseded version remains after reinstall" }
-
-            $keptData = Join-Path $env:HOME '.yucode\agent\keep'
-            New-Item -ItemType Directory -Force -Path (Split-Path $keptData) | Out-Null
-            [IO.File]::WriteAllText($keptData, "keep`n", [Text.UTF8Encoding]::new($false))
-            Invoke-InstallerAction -InstallerArguments @('--uninstall')
-            if (Test-Path -LiteralPath $installRoot) { throw "Install root remains after uninstall" }
-            if ([IO.File]::ReadAllText($keptData).Trim() -ne 'keep') { throw "User data was removed" }
-
-            $fakePackage = Join-Path $smokeRoot 'npm-package'
-            $fakeBin = Join-Path $fakePackage 'bin'
-            New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
-            $fakeManifest = [ordered]@{
-              name = '@yusys-ai/yucode'
-              version = '0.0.0'
-              bin = [ordered]@{ yucode = 'bin/yucode.js' }
-            }
-            [IO.File]::WriteAllText(
-              (Join-Path $fakePackage 'package.json'),
-              (($fakeManifest | ConvertTo-Json) + "`n"),
-              [Text.UTF8Encoding]::new($false)
-            )
-            [IO.File]::WriteAllText(
-              (Join-Path $fakeBin 'yucode.js'),
-              "#!/usr/bin/env node`nconsole.log('npm smoke')`n",
-              [Text.UTF8Encoding]::new($false)
-            )
-            & npm pack $fakePackage --pack-destination $smokeRoot --ignore-scripts | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Unable to pack npm migration fixture" }
-            $fakeTgz = Join-Path $smokeRoot 'yusys-ai-yucode-0.0.0.tgz'
-            if (-not (Test-Path -LiteralPath $fakeTgz -PathType Leaf)) { throw "npm migration fixture is missing" }
-            & npm install -g $fakeTgz --ignore-scripts
-            if ($LASTEXITCODE -ne 0) { throw "Unable to install npm migration fixture" }
-            $npmRoot = (& npm root -g | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0) { throw "Unable to resolve npm migration root" }
-            $npmPackage = Join-Path $npmRoot '@yusys-ai\yucode'
-            if (-not (Test-Path -LiteralPath (Join-Path $npmPackage 'package.json') -PathType Leaf)) {
-              throw "npm migration fixture was not installed"
-            }
-
-            Invoke-InstallerAction -InstallerArguments @('--version', $env:RELEASE_VERSION, '--no-modify-path')
-            if (Test-Path -LiteralPath $npmPackage) { throw "npm package remains after migration" }
-            if (-not (Test-Path -LiteralPath $wrapper -PathType Leaf)) { throw "Native wrapper is missing after migration" }
-            $reportedVersion = (& $wrapper --version | Out-String).Trim()
-            if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne $env:RELEASE_VERSION) {
-              throw "Migrated yucode reported an unexpected version"
-            }
-            & $wrapper --help | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Migrated yucode help smoke failed" }
-
-            Invoke-InstallerAction -InstallerArguments @('--uninstall', '--purge')
-            if (Test-Path -LiteralPath $installRoot) { throw "Install root remains after final uninstall" }
-            if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.yucode')) { throw "User data remains after purge" }
-          } finally {
-            Remove-Item -LiteralPath $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
-          }
+          jq -r '.assets[].name' <<<"${release_json}" | sort > "${verification}/api-assets"
+          awk '{print $2}' "${verification}/release/SHA256SUMS" > "${verification}/expected-assets"
+          printf '%s\n' SHA256SUMS >> "${verification}/expected-assets"
+          sort -o "${verification}/expected-assets" "${verification}/expected-assets"
+          diff -u "${verification}/expected-assets" "${verification}/api-assets"
+          while IFS= read -r filename; do
+            digest="$(sha256sum "${verification}/release/${filename}" | awk '{print $1}')"
+            size="$(stat -c %s "${verification}/release/${filename}")"
+            asset="$(jq -ce --arg filename "${filename}" '.assets[] | select(.name == $filename)' <<<"${release_json}")"
+            test "$(jq -r .state <<<"${asset}")" = uploaded
+            test "$(jq -r .digest <<<"${asset}")" = "sha256:${digest}"
+            test "$(jq -r .size <<<"${asset}")" = "${size}"
+          done < "${verification}/expected-assets"
