@@ -255,12 +255,26 @@ managed_wrapper() {
 		NR == 3 && $0 != "set -eu" { exit 1 }
 		NR == 4 && $0 != ": \"${HOME:?HOME must be set}\"" { exit 1 }
 		NR == 5 {
-			if ($0 !~ /^version=(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc[1-9][0-9]*)?$/) exit 1
-			if (expected_version != "" && $0 != "version=" expected_version) exit 1
+			if ($0 == "version=$(sed -n '\''1p'\'' \"${HOME}/.local/share/yucode/state/version\")") {
+				modern = 1
+			} else {
+				if ($0 !~ /^version=(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc[1-9][0-9]*)?$/) exit 1
+				if (expected_version != "" && $0 != "version=" expected_version) exit 1
+				legacy = 1
+			}
 		}
-		NR == 6 && $0 != "exec \"${HOME}/.local/share/yucode/versions/${version}/yucode\" \"$@\"" { exit 1 }
-		NR > 6 { exit 1 }
-		END { if (NR != 6) exit 1 }
+		NR == 6 {
+			if (legacy && $0 != "exec \"${HOME}/.local/share/yucode/versions/${version}/yucode\" \"$@\"") exit 1
+			if (modern && $0 != "package_directory=\"${HOME}/.local/share/yucode/versions/${version}\"") exit 1
+		}
+		NR == 7 && modern && $0 != "if [ \"${1:-}\" = \"update\" ]; then" { exit 1 }
+		NR == 8 && modern && $0 != "  exec \"${package_directory}/yucode-update.sh\" \"$@\"" { exit 1 }
+		NR == 9 && modern && $0 != "fi" { exit 1 }
+		NR == 10 && modern && $0 != "YUCODE_NATIVE_PACKAGE_DIR=\"${package_directory}\" exec \"${package_directory}/yucode\" \"$@\"" { exit 1 }
+		NR > 10 { exit 1 }
+		END {
+			if (!((legacy && NR == 6) || (modern && NR == 10))) exit 1
+		}
 	' "$WRAPPER"
 }
 
@@ -313,10 +327,24 @@ write_wrapper() {
 		printf '%s\n' '# YUCODE_INSTALLER_MANAGED=1'
 		printf '%s\n' 'set -eu'
 		printf '%s\n' ": \"\${HOME:?HOME must be set}\""
-		printf 'version=%s\n' "$version"
-		printf '%s\n' "exec \"\${HOME}/.local/share/yucode/versions/\${version}/yucode\" \"\$@\""
+		if [ -f "$VERSIONS_DIRECTORY/$version/install.sh" ] && [ ! -L "$VERSIONS_DIRECTORY/$version/install.sh" ] \
+			&& [ -x "$VERSIONS_DIRECTORY/$version/yucode-update.sh" ] && [ ! -L "$VERSIONS_DIRECTORY/$version/yucode-update.sh" ]; then
+			printf '%s\n' 'version=$(sed -n '\''1p'\'' "${HOME}/.local/share/yucode/state/version")'
+			printf '%s\n' 'package_directory="${HOME}/.local/share/yucode/versions/${version}"'
+			printf '%s\n' 'if [ "${1:-}" = "update" ]; then'
+			printf '%s\n' '  exec "${package_directory}/yucode-update.sh" "$@"'
+			printf '%s\n' 'fi'
+			printf '%s\n' 'YUCODE_NATIVE_PACKAGE_DIR="${package_directory}" exec "${package_directory}/yucode" "$@"'
+		else
+			printf 'version=%s\n' "$version"
+			printf '%s\n' "exec \"\${HOME}/.local/share/yucode/versions/\${version}/yucode\" \"\$@\""
+		fi
 	} > "$wrapper_temp"
 	chmod 755 "$wrapper_temp"
+	if [ -f "$WRAPPER" ] && cmp -s "$wrapper_temp" "$WRAPPER"; then
+		rm -f "$wrapper_temp"
+		return
+	fi
 	mv -f "$wrapper_temp" "$WRAPPER"
 }
 
@@ -931,6 +959,7 @@ validate_install_paths
 user_path_has_no_symlinks "$LOCK_DIRECTORY" || fail "Installer lock path passes through a symbolic link: $LOCK_DIRECTORY"
 
 require_command awk
+require_command cmp
 require_command mkdir
 require_command mktemp
 require_command sed

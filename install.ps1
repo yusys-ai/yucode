@@ -226,21 +226,64 @@ function Test-ManagedWrapper {
 	$item = Get-Item -LiteralPath $Path -Force
 	if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
 	$versionPattern = if ([String]::IsNullOrEmpty($Version)) { $script:VersionExpression } else { [Text.RegularExpressions.Regex]::Escape($Version) }
-	$pattern = '\A@echo off\r?\nrem YUCODE_INSTALLER_MANAGED=1\r?\n"%~dp0\.\.\\versions\\' + $versionPattern + '\\yucode\.exe" %\*\r?\n\z'
-	return [Text.RegularExpressions.Regex]::IsMatch([IO.File]::ReadAllText($Path), $pattern)
+	$legacyPattern = '\A@echo off\r?\nrem YUCODE_INSTALLER_MANAGED=1\r?\n"%~dp0\.\.\\versions\\' + $versionPattern + '\\yucode\.exe" %\*\r?\n\z'
+	$modernContent = @(
+		'@echo off',
+		'rem YUCODE_INSTALLER_MANAGED=1',
+		'setlocal EnableExtensions DisableDelayedExpansion',
+		'set "version="',
+		'set /p version=<"%~dp0..\state\version"',
+		'if not defined version exit /b 1',
+		'set "YUCODE_NATIVE_PACKAGE_DIR=%~dp0..\versions\%version%"',
+		'if /i "%~1"=="update" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%YUCODE_NATIVE_PACKAGE_DIR%\yucode-update.ps1" %*',
+		'if /i "%~1"=="update" exit /b %ERRORLEVEL%',
+		'"%YUCODE_NATIVE_PACKAGE_DIR%\yucode.exe" %*',
+		'exit /b %ERRORLEVEL%'
+	) -join "`r`n"
+	$modernContent += "`r`n"
+	$content = [IO.File]::ReadAllText($Path)
+	return [Text.RegularExpressions.Regex]::IsMatch($content, $legacyPattern) -or $content -ceq $modernContent
 }
 
 function Write-Wrapper {
-	param([string]$Path, [string]$Version)
+	param([string]$Path, [string]$Version, [string]$VersionsDirectory)
 	if (Test-Path -LiteralPath $Path) {
 		if (-not (Test-ManagedWrapper $Path)) { Fail "Refusing to replace an unmanaged command: $Path" }
 	}
-	$content = @(
-		'@echo off',
-		'rem YUCODE_INSTALLER_MANAGED=1',
-		"`"%~dp0..\versions\$Version\yucode.exe`" %*"
-	) -join "`r`n"
+	$versionDirectory = Join-Path $VersionsDirectory $Version
+	$installerPath = Join-Path $versionDirectory 'install.ps1'
+	$updateHostPath = Join-Path $versionDirectory 'yucode-update.ps1'
+	$hasUpdateHost = (Test-Path -LiteralPath $installerPath -PathType Leaf) -and (Test-Path -LiteralPath $updateHostPath -PathType Leaf)
+	if ($hasUpdateHost) {
+		foreach ($updatePath in @($installerPath, $updateHostPath)) {
+			if (((Get-Item -LiteralPath $updatePath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+				$hasUpdateHost = $false
+			}
+		}
+	}
+	$content = if ($hasUpdateHost) {
+		@(
+			'@echo off',
+			'rem YUCODE_INSTALLER_MANAGED=1',
+			'setlocal EnableExtensions DisableDelayedExpansion',
+			'set "version="',
+			'set /p version=<"%~dp0..\state\version"',
+			'if not defined version exit /b 1',
+			'set "YUCODE_NATIVE_PACKAGE_DIR=%~dp0..\versions\%version%"',
+			'if /i "%~1"=="update" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%YUCODE_NATIVE_PACKAGE_DIR%\yucode-update.ps1" %*',
+			'if /i "%~1"=="update" exit /b %ERRORLEVEL%',
+			'"%YUCODE_NATIVE_PACKAGE_DIR%\yucode.exe" %*',
+			'exit /b %ERRORLEVEL%'
+		) -join "`r`n"
+	} else {
+		@(
+			'@echo off',
+			'rem YUCODE_INSTALLER_MANAGED=1',
+			"`"%~dp0..\versions\$Version\yucode.exe`" %*"
+		) -join "`r`n"
+	}
 	$content += "`r`n"
+	if ((Test-Path -LiteralPath $Path -PathType Leaf) -and [IO.File]::ReadAllText($Path) -ceq $content) { return }
 	$temporary = "$Path.tmp.$([Guid]::NewGuid().ToString('N'))"
 	try {
 		[IO.File]::WriteAllText($temporary, $content, [Text.ASCIIEncoding]::new())
@@ -485,6 +528,13 @@ function Test-NativeInstallation {
 	$state = Read-State $StatePath
 	if ($null -eq $state) { Fail 'Managed installation state is incomplete' }
 	$version = [string]$state.version
+	$stateVersionPath = Join-Path (Split-Path -Parent $StatePath) 'version'
+	if (Test-Path -LiteralPath $stateVersionPath) {
+		$stateVersionItem = Get-Item -LiteralPath $stateVersionPath -Force
+		if ($stateVersionItem.PSIsContainer -or ($stateVersionItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [IO.File]::ReadAllText($stateVersionPath).Trim() -cne $version) {
+			Fail 'Managed installation version pointer is invalid'
+		}
+	}
 	$versionDirectory = Join-Path $VersionsDirectory $version
 	$binaryPath = Join-Path $versionDirectory 'yucode.exe'
 	$manifestPath = Join-Path $versionDirectory 'package.json'
@@ -603,8 +653,11 @@ function Assert-PartialManagedInstallation {
 	}
 	$stateDirectory = Split-Path -Parent $StatePath
 	foreach ($entry in (Get-ChildItem -LiteralPath $stateDirectory -Force)) {
-		if ($entry.Name -cne 'managed' -or $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+		if (@('managed', 'version') -cnotcontains $entry.Name -or $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
 			Fail "Refusing to remove an incomplete installation containing unmanaged state: $($entry.FullName)"
+		}
+		if ($entry.Name -ceq 'version' -and -not (Test-Version ([IO.File]::ReadAllText($entry.FullName).Trim()))) {
+			Fail "Refusing to remove an incomplete installation containing invalid state: $($entry.FullName)"
 		}
 	}
 	if (Test-Path -LiteralPath $BinDirectory -PathType Container) {
@@ -699,6 +752,7 @@ function Install-Yucode {
 		[string]$VersionsDirectory,
 		[string]$StateDirectory,
 		[string]$StatePath,
+		[string]$StateVersionPath,
 		[string]$BinDirectory,
 		[string]$Wrapper,
 		[string]$Channel,
@@ -706,7 +760,7 @@ function Install-Yucode {
 		[string]$ReleaseAssets,
 		[bool]$NoModifyPath
 	)
-	foreach ($path in @($InstallRoot, $VersionsDirectory, $StateDirectory, $StatePath, $BinDirectory, $Wrapper)) {
+	foreach ($path in @($InstallRoot, $VersionsDirectory, $StateDirectory, $StatePath, $StateVersionPath, $BinDirectory, $Wrapper)) {
 		Assert-ManagedPath $path $LocalAppDataRoot $true
 	}
 	$existingState = Read-State $StatePath
@@ -726,7 +780,7 @@ function Install-Yucode {
 	if ((Test-Path -LiteralPath $Wrapper) -and -not (Test-ManagedWrapper $Wrapper)) {
 		Fail "Refusing to replace an unmanaged command: $Wrapper"
 	}
-	foreach ($path in @($InstallRoot, $VersionsDirectory, $StateDirectory, $BinDirectory, $Wrapper)) {
+	foreach ($path in @($InstallRoot, $VersionsDirectory, $StateDirectory, $StateVersionPath, $BinDirectory, $Wrapper)) {
 		Assert-ManagedPath $path $LocalAppDataRoot $true
 	}
 	New-Item -ItemType Directory -Force -Path $StateDirectory, $VersionsDirectory, $BinDirectory | Out-Null
@@ -842,8 +896,11 @@ function Install-Yucode {
 		Assert-ManagedPath $StatePath $LocalAppDataRoot $true
 		Write-AtomicText $StatePath (($state | ConvertTo-Json) + "`n")
 		Assert-ManagedPath $StatePath $LocalAppDataRoot $false
+		Assert-ManagedPath $StateVersionPath $LocalAppDataRoot $true
+		Write-AtomicText $StateVersionPath "$version`n"
+		Assert-ManagedPath $StateVersionPath $LocalAppDataRoot $false
 		Assert-ManagedPath $Wrapper $LocalAppDataRoot $true
-		Write-Wrapper $Wrapper $version
+		Write-Wrapper $Wrapper $version $VersionsDirectory
 		Assert-ManagedPath $Wrapper $LocalAppDataRoot $false
 	} finally {
 		Assert-ManagedPath $stagingDirectory $LocalAppDataRoot $true
@@ -953,6 +1010,7 @@ $installRoot = Join-Path $localAppDataRoot 'Yusys\CodeMate'
 $versionsDirectory = Join-Path $installRoot 'versions'
 $stateDirectory = Join-Path $installRoot 'state'
 $statePath = Join-Path $stateDirectory 'install.json'
+$stateVersionPath = Join-Path $stateDirectory 'version'
 $binDirectory = Join-Path $installRoot 'bin'
 $wrapper = Join-Path $binDirectory 'yucode.cmd'
 $mutexName = "Global\YusysCodeMateInstaller-$($identity.User.Value)"
@@ -972,7 +1030,7 @@ try {
 	if ($action -eq 'uninstall') {
 		Uninstall-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -Wrapper $wrapper -StatePath $statePath -BinDirectory $binDirectory -UserDataDirectory $userDataDirectory -Purge $purge
 	} else {
-		Install-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -StateDirectory $stateDirectory -StatePath $statePath -BinDirectory $binDirectory -Wrapper $wrapper -Channel $channel -VersionOverride $versionOverride -ReleaseAssets $releaseAssets -NoModifyPath $noModifyPath
+		Install-Yucode -LocalAppDataRoot $localAppDataRoot -InstallRoot $installRoot -VersionsDirectory $versionsDirectory -StateDirectory $stateDirectory -StatePath $statePath -StateVersionPath $stateVersionPath -BinDirectory $binDirectory -Wrapper $wrapper -Channel $channel -VersionOverride $versionOverride -ReleaseAssets $releaseAssets -NoModifyPath $noModifyPath
 		Invoke-InstallNpmMigration $localAppDataRoot $installRoot $statePath $versionsDirectory $binDirectory $wrapper
 		Assert-ManagedPath $StatePath $localAppDataRoot $false
 		$installedState = Read-State $statePath
